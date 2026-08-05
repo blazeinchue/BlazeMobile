@@ -1,0 +1,6 @@
+{
+  "name": "Blaze",
+  "description": "Blaze AI Assistant - Streamlined interactive chat application with custom AI model selection, profile settings, and dynamic dark and light theme controls.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

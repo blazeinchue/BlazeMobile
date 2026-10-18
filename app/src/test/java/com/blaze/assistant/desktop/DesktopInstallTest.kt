@@ -34,7 +34,7 @@ class DesktopInstallTest {
     }
 
     @Test fun plainLines() {
-        assertEquals("Connection dropped. Retrying (2 of 12)\u2026", DesktopInstall.retryLine(Fail.NETWORK, 2, 5, null))
+        assertEquals("Connection dropped. Retrying (2 of 5)\u2026", DesktopInstall.retryLine(Fail.NETWORK, 2, 5, null))
         assertEquals("Connection dropped. Trying another server (eu.edge.kernel.org), 3 of 5\u2026",
             DesktopInstall.retryLine(Fail.NETWORK, 3, 5, "eu.edge.kernel.org"))
         assertTrue(DesktopInstall.failLine(Fail.NETWORK, "").contains("tap Start to carry on"))

@@ -125,24 +125,32 @@ class BlazeAccessibilityService : AccessibilityService() {
     /** Screenshot of the default display, downscaled, as a data:image/jpeg URL. Android 11+. */
     suspend fun screenshot(): String? {
         if (android.os.Build.VERSION.SDK_INT < 30) return null
-        val bmp = suspendCancellableCoroutine<android.graphics.Bitmap?> { cont ->
+        // v0.33.3: the hardware buffer is copied, scaled (720 px long side) and compressed (JPEG 60) off the main thread.
+        val buf = suspendCancellableCoroutine<ScreenshotResult?> { cont ->
             try {
                 takeScreenshot(android.view.Display.DEFAULT_DISPLAY, mainExecutor,
                     object : TakeScreenshotCallback {
-                        override fun onSuccess(r: ScreenshotResult) {
-                            val hw = android.graphics.Bitmap.wrapHardwareBuffer(r.hardwareBuffer, r.colorSpace)
-                            val sw = hw?.copy(android.graphics.Bitmap.Config.ARGB_8888, false)
-                            r.hardwareBuffer.close()
-                            if (cont.isActive) cont.resume(sw)
-                        }
+                        override fun onSuccess(r: ScreenshotResult) { if (cont.isActive) cont.resume(r) else r.hardwareBuffer.close() }
                         override fun onFailure(code: Int) { if (cont.isActive) cont.resume(null) }
                     })
             } catch (_: Exception) { if (cont.isActive) cont.resume(null) }
         } ?: return null
-        val scale = minOf(1f, 1280f / maxOf(bmp.width, bmp.height))
-        val small = if (scale < 1f) android.graphics.Bitmap.createScaledBitmap(bmp, (bmp.width * scale).toInt(), (bmp.height * scale).toInt(), true) else bmp
-        val out = java.io.ByteArrayOutputStream()
-        small.compress(android.graphics.Bitmap.CompressFormat.JPEG, 70, out)
+        val out = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
+            try {
+                val hw = android.graphics.Bitmap.wrapHardwareBuffer(buf.hardwareBuffer, buf.colorSpace) ?: return@withContext null
+                val scale = com.blaze.assistant.agent.VisionFast.scaleFor(hw.width, hw.height)
+                // Scale straight from the hardware bitmap when possible (one software copy at the small size).
+                val small = try {
+                    if (scale < 1f) android.graphics.Bitmap.createScaledBitmap(hw, (hw.width * scale).toInt().coerceAtLeast(1), (hw.height * scale).toInt().coerceAtLeast(1), true)
+                        .let { if (it.config == android.graphics.Bitmap.Config.HARDWARE) it.copy(android.graphics.Bitmap.Config.ARGB_8888, false) else it }
+                    else hw.copy(android.graphics.Bitmap.Config.ARGB_8888, false)
+                } catch (_: Exception) {
+                    val sw = hw.copy(android.graphics.Bitmap.Config.ARGB_8888, false)
+                    if (scale < 1f) android.graphics.Bitmap.createScaledBitmap(sw, (sw.width * scale).toInt().coerceAtLeast(1), (sw.height * scale).toInt().coerceAtLeast(1), true) else sw
+                } ?: return@withContext null
+                java.io.ByteArrayOutputStream().also { small.compress(android.graphics.Bitmap.CompressFormat.JPEG, com.blaze.assistant.agent.VisionFast.JPEG_QUALITY, it) }
+            } catch (_: Exception) { null } finally { try { buf.hardwareBuffer.close() } catch (_: Exception) { } }
+        } ?: return null
         return "data:image/jpeg;base64," + android.util.Base64.encodeToString(out.toByteArray(), android.util.Base64.NO_WRAP)
     }
 

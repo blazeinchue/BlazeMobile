@@ -45,27 +45,38 @@ object Linux {
             // plain HttpURLConnection to one mirror: a dropped connection failed the install, and a cut-short file went
             // straight to the unpacker.
             val a = arch()
-            val tgz = File(app.cacheDir, "alpine-$VER-$a.tar.gz")
-            status.value = "Downloading Alpine Linux…"
-            try {
-                Fetch.download(AlpineNet.rootfsUrls(a), tgz, AlpineNet.ROOTFS_SHA256[a].orEmpty(), progress = { got, total, retry ->
-                    status.value = retry ?: if (total > 0) "Downloading Alpine Linux… ${got * 100 / total}%" else "Downloading Alpine Linux…"
-                })
-            } catch (e: Exception) {
-                val m = "${Fetch.reason(e)}, so Linux didn't finish downloading. What's downloaded is kept: tap Install to carry on."
-                status.value = m
-                return@withContext m
-            }
-            status.value = "Unpacking…"
-            rootfs().deleteRecursively(); rootfs().mkdirs()
-            val n = try { untar(tgz, rootfs()) } catch (e: Exception) {
-                tgz.delete(); status.value = "Unpacking failed: ${e.message}. Tap Install to retry."
-                return@withContext "Unpacking failed: ${e.message}"
-            }
-            tgz.delete()
-            if (!File(rootfs(), "bin/busybox").exists()) {
-                status.value = "Unpacking failed ($n files). Tap Install to retry."
-                return@withContext "Unpacking failed: busybox missing after $n files."
+            // v0.33.3: kept in filesDir (cacheDir can be cleared by Android mid-download) and resumed from its .part.
+            val tgz = File(base(), "alpine-$VER-$a.tar.gz").also { base().mkdirs() }
+            File(app.cacheDir, "alpine-$VER-$a.tar.gz").let { old -> if (old.exists() && !tgz.exists()) old.renameTo(tgz) }
+            File(app.cacheDir, "alpine-$VER-$a.tar.gz.part").let { old -> val np = File(tgz.path + ".part"); if (old.exists() && !np.exists()) old.renameTo(np) }
+            val unpacked = File(rootfs(), ".blaze_unpacked")
+            if (!(unpacked.exists() && File(rootfs(), "bin/busybox").exists())) {
+                val sha = AlpineNet.ROOTFS_SHA256[a].orEmpty()
+                val resumed = File(tgz.path + ".part").let { it.exists() && it.length() > 0 }
+                status.value = if (resumed) "Resuming the Linux download\u2026" else "Downloading Alpine Linux\u2026"
+                try {
+                    Fetch.download(AlpineNet.rootfsUrls(a), tgz, sha, progress = { got, total, retry ->
+                        status.value = retry ?: Fetch.mbLine("Alpine Linux", got, total, resumed)
+                    })
+                } catch (e: Exception) {
+                    val m = "${Fetch.reason(e)}, so Linux didn't finish downloading. What's downloaded is kept: tap Install to carry on."
+                    status.value = m
+                    return@withContext m
+                }
+                status.value = "Unpacking\u2026"
+                rootfs().deleteRecursively(); rootfs().mkdirs()
+                val n = try { untar(tgz, rootfs()) } catch (e: Exception) {
+                    // Only a damaged archive is thrown away; a verified one is kept so the next try just unpacks again.
+                    if (sha.isBlank() || Fetch.sha256(tgz) != sha) tgz.delete()
+                    status.value = "Unpacking failed: ${e.message}. Tap Install to retry."
+                    return@withContext "Unpacking failed: ${e.message}"
+                }
+                if (!File(rootfs(), "bin/busybox").exists()) {
+                    status.value = "Unpacking failed ($n files). Tap Install to retry."
+                    return@withContext "Unpacking failed: busybox missing after $n files."
+                }
+                unpacked.writeText(VER)   // stage marker: a later failure (prepare) never downloads or unpacks again
+                tgz.delete()
             }
             prepare()
             File(rootfs(), ".blaze_ok").writeText(VER)

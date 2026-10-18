@@ -64,12 +64,17 @@ object DesktopPlan {
     fun reposLine(mirror: String): String = "mkdir -p /etc/apk && printf '%s' '" + com.blaze.assistant.terminal.AlpineNet.repositories(mirror).replace("'", "") + "' > /etc/apk/repositories"
 
     /** One install step: refresh the package list from [mirror] when [update], then add [pkgs] (none for the update-only step). */
-    fun stepScript(mirror: String, pkgs: List<String>, update: Boolean): String = buildString {
+    fun stepScript(mirror: String, pkgs: List<String>, update: Boolean, staged: List<DesktopPrefetch.Pkg> = emptyList()): String = buildString {
         append("set -e\n").append(reposLine(mirror)).append('\n').append(APK_TIMEOUT_PROBE).append('\n')
+        // v0.33.3: apk keeps what it downloaded (a failed batch no longer throws away the packages it already fetched).
+        append(APK_CACHE).append('\n')
         if (update) append("apk \$T update\n")
-        if (pkgs.isNotEmpty()) append("apk \$T add ").append(pkgs.joinToString(" ")).append('\n')
+        if (pkgs.isNotEmpty()) append(DesktopPrefetch.installLines(pkgs, staged))
         append("echo BLAZE_STEP_OK")
     }
+
+    /** v0.33.3: turns on apk's package cache (/etc/apk/cache → /var/cache/apk). */
+    const val APK_CACHE = "mkdir -p /var/cache/apk && { [ -e /etc/apk/cache ] || ln -s /var/cache/apk /etc/apk/cache; }"
 
     /** The last step: folders the session needs, and the "installed" mark. */
     const val FINISH_SCRIPT = "set -e\nmkdir -p /root/.vnc /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix\n" +

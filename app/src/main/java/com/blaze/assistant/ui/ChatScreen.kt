@@ -207,6 +207,9 @@ fun ChatScreen() {
     var clearedAt by remember { mutableStateOf(0L) }
     var input by remember { mutableStateOf(TextFieldValue("")) }
     var quote by rememberSaveable { mutableStateOf("") }
+    // v0.33.3: a card inside a reply (an app tile's long-press) can fill the quote box.
+    val cardQuote by ChatQuote.request.collectAsState()
+    LaunchedEffect(cardQuote) { if (cardQuote.isNotBlank()) { quote = cardQuote; ChatQuote.request.value = "" } }
 
     var pending by remember { mutableStateOf(listOf<Attachment>()) }
     var loadingFiles by remember { mutableStateOf(false) }

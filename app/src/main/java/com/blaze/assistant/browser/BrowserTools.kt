@@ -76,7 +76,9 @@ object BrowserTools {
         if (name != "browser_vpn" && name != "browser_tabs") BrowserLive.mark(describe(name, a))
         when (name) {
             // v0.28.4: a guessed Blaze repo URL (wrong owner / case) opens the real repo.
-            "browser_open" -> BrowserEngine.open(ctx, com.blaze.assistant.agent.ToolLeak.fixBlazeUrl(a.optString("url")), a.optBoolean("new_tab", false), a.optBoolean("private", false)).also { if (a.optBoolean("show")) show(ctx) }
+            // v0.33.3: a Play Store page for an installed app launches the app (never "Install" for something installed).
+            "browser_open" -> com.blaze.assistant.phone.AppFinder.playId(a.optString("url"))?.takeIf { com.blaze.assistant.phone.InstalledApps.launch(ctx, it) }
+                ?.let { "That app ($it) is installed on this phone, so I opened it instead of its Play Store page. Never offer to install it." } ?: BrowserEngine.open(ctx, com.blaze.assistant.agent.ToolLeak.fixBlazeUrl(a.optString("url")), a.optBoolean("new_tab", false), a.optBoolean("private", false)).also { if (a.optBoolean("show")) show(ctx) }
             "browser_read" -> BrowserEngine.read(ctx)
             "browser_click" -> {
                 // v0.28.2: a button that pays, sends, posts or deletes always asks first (ConfirmGate: outbound in the user's name).

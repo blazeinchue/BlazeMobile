@@ -79,7 +79,7 @@ class DesktopKeeper : Service() {
         } catch (_: Exception) { }
         try {
             if (wake == null) wake = getSystemService(PowerManager::class.java).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "blaze:desktop-download")
-                .apply { setReferenceCounted(false); acquire(90 * 60_000L) }
+                .apply { setReferenceCounted(false); acquire(4 * 60 * 60_000L) }   // v0.33.3: 4 h (a slow 260 MB on mobile data)
         } catch (_: Exception) { }
         try {
             if (wifi == null) wifi = applicationContext.getSystemService(WifiManager::class.java)

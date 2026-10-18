@@ -12,7 +12,7 @@ import org.json.JSONObject
 object RichKit {
     /** Fence languages that are interactive blocks (```buttons is an alias of ```choices). */
     val LANGS = mapOf("chart" to "chart", "choices" to "choices", "buttons" to "choices", "form" to "form",
-        "tool" to "tool", "calculator" to "tool", "compare" to "compare", "table" to "table")
+        "tool" to "tool", "calculator" to "tool", "compare" to "compare", "table" to "table", "apps" to "apps")
 
     const val MAX_POINTS = 60
     const val MAX_SERIES = 4
@@ -23,6 +23,26 @@ object RichKit {
     const val MAX_OUTPUTS = 5
     const val MAX_COLS = 3
     const val MAX_ROWS = 14
+
+    // ---------- apps (v0.33.3) ----------
+    /** One installed app on the card: its label and real package (so a quoted tile tells the agent exactly which app). */
+    data class AppTile(val label: String, val pkg: String, val game: Boolean = false)
+    data class AppsCard(val title: String, val apps: List<AppTile>)
+
+    /** ```apps {"title":"Your apps (42)","apps":[{"label":"Rally Horizon","pkg":"com.x.rally","game":true}]} */
+    fun apps(body: String): AppsCard? {
+        val o = json(body) as? JSONObject ?: return null
+        val arr = o.optJSONArray("apps") ?: return null
+        val list = (0 until arr.length()).mapNotNull { i ->
+            val a = arr.optJSONObject(i) ?: return@mapNotNull null
+            val pkg = a.optString("pkg").ifBlank { a.optString("package") }.trim()
+            val label = a.optString("label").ifBlank { a.optString("name") }.trim()
+            if (pkg.isEmpty() || !Regex("^[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z0-9_]+)+$").matches(pkg)) null
+            else AppTile(label.ifEmpty { pkg }, pkg, a.optBoolean("game"))
+        }.distinctBy { it.pkg }
+        if (list.isEmpty()) return null
+        return AppsCard(o.optString("title").trim(), list.take(300))
+    }
 
     // ---------- chart ----------
     enum class ChartType { BAR, LINE, PIE, SCATTER }
@@ -480,6 +500,7 @@ object RichKit {
                         t.outputs.zip(compute(t, d)).joinToString("\n") { (o, v) -> "- ${o.label}: ${v.ifEmpty { "\u2014" }}" }
                 }
                 "table" -> table(body)?.let { tablePlain(it) }
+                "apps" -> apps(body)?.let { c -> (c.title.ifBlank { "Apps" }) + "\n" + c.apps.joinToString("\n") { "- ${it.label} (${it.pkg})" } }
                 "choices" -> choices(body)?.let { c -> (if (c.prompt.isNotBlank()) c.prompt + "\n" else "") + c.options.joinToString("\n") { "- ${it.label}" } }
                 "form" -> form(body)?.let { f -> (f.title.ifBlank { f.submit }) + "\n" + f.fields.joinToString("\n") { "- ${it.label}:" } }
                 else -> null

@@ -85,7 +85,12 @@ class SiteAppActivity : ComponentActivity() {
             override fun shouldOverrideUrlLoading(view: WebView, req: WebResourceRequest): Boolean {
                 val u = req.url.toString()
                 if (SiteLogic.inScope(u, app.scope)) return false
-                openOutside(req.url)
+                // v0.33.3: intent://, market:, mailto:, tel:… and https links another installed app verifiably handles
+                // go to that app; other out-of-scope pages open in the Blaze browser. Subframes stay in the page.
+                if (!req.isForMainFrame) return false
+                if (com.blaze.assistant.browser.AppLinks.handle(this@SiteAppActivity, view, req, view.url ?: app.startUrl)) return true
+                val sc = req.url.scheme.orEmpty().lowercase()
+                if (sc == "http" || sc == "https") openOutside(req.url)
                 return true
             }
             override fun onPageFinished(view: WebView, url: String?) { hideSplash() }
@@ -136,7 +141,7 @@ class SiteAppActivity : ComponentActivity() {
         try {
             if (u.scheme == "http" || u.scheme == "https")
                 startActivity(Intent(Intent.ACTION_VIEW, u).setClass(this, com.blaze.assistant.browser.BrowserActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-            else startActivity(Intent(Intent.ACTION_VIEW, u).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            else com.blaze.assistant.browser.AppLinks.openExternal(this, web, u)
         } catch (_: Exception) { }
     }
 

@@ -161,6 +161,8 @@ object SkillMatch {
 
     // v0.26.1: an in-chat diagram / chart doesn't pull in the file-route skills (VisualRoute); it's drawn in the reply.
     fun forTurn(query: String): Result = try {
+        // v0.33.3: "list my apps" is about the phone (list_apps), never a skill whose words overlap (product-listing).
+        if (com.blaze.assistant.phone.AppFinder.isAppsAsk(query)) Result.NONE else
         match(query, VisualRoute.filter(query, cached()).filter { SkillGuard.strongHit(query, it) }, fullMin = FULL_MIN, fullWords = FULL_WORDS, maxOthers = 4)
     } catch (_: Throwable) { Result.NONE }
 
@@ -185,7 +187,7 @@ object SkillMatch {
     }
 
     /** The per-turn skills block: the 2-3 best matches with short descriptions and one line about find_skill. No name list. */
-    fun lookupBlock(query: String, skip: Set<String> = emptySet()): String = try {
+    fun lookupBlock(query: String, skip: Set<String> = emptySet()): String = if (com.blaze.assistant.phone.AppFinder.isAppsAsk(query)) "" else try {
         // v0.30.5: skills that only share a stray word with the request are never suggested (SkillGuard.strongHit).
         val cands = VisualRoute.filter(query, cached())
         val weak = cands.filter { !SkillGuard.strongHit(query, it) }.map { it.name }.toSet()

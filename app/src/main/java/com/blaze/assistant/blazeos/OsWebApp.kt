@@ -188,6 +188,9 @@ fun OsWebApp(inst: OsInstalled) {
                     val inside = if (hosted && m.scope.isNotEmpty()) com.blaze.assistant.siteapps.SiteLogic.inScope(req.url.toString(), m.scope)
                         else if (hosted) h == hostedHost else h == OsWeb.host(m.id)
                     if (inside) return false
+                    // v0.33.3: intent:// and other apps' schemes go to the app that handles them (no loop, page kept otherwise).
+                    val sc = req.url.scheme.orEmpty().lowercase()
+                    if (sc != "http" && sc != "https") { com.blaze.assistant.browser.AppLinks.handle(view.context, view, req); return true }
                     // Leaving the app: open in the BlazeOS Browser.
                     if (req.url.scheme == "https" || req.url.scheme == "http") { OsBrowser.pending.value = req.url.toString(); BlazeOs.launch("blaze:browser") }
                     return true
@@ -250,7 +253,9 @@ fun OsBrowserApp() {
             OsWeb.obtain(ctx, "blaze:browser") { w ->
                 w.webViewClient = object : WebViewClient() {
                     override fun onPageFinished(view: WebView, url: String?) { address = url.orEmpty(); title = view.title.orEmpty() }
-                    override fun shouldOverrideUrlLoading(view: WebView, req: WebResourceRequest): Boolean = req.url.scheme !in setOf("http", "https")
+                    // v0.33.3: intent://, market:, mailto:, tel:… and cross-site https App Links open the app that handles them.
+                    override fun shouldOverrideUrlLoading(view: WebView, req: WebResourceRequest): Boolean =
+                        com.blaze.assistant.browser.AppLinks.handle(view.context, view, req, address.ifBlank { view.url })
                 }
                 w.loadUrl(OsBrowser.pending.value.ifEmpty { "https://duckduckgo.com/" })
                 OsBrowser.pending.value = ""

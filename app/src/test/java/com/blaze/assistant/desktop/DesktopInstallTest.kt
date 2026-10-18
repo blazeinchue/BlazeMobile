@@ -26,7 +26,7 @@ class DesktopInstallTest {
     }
 
     @Test fun backoffAndMirrorRotation() {
-        assertEquals(listOf(0, 3, 6, 12, 24, 30), (1..6).map { DesktopInstall.backoffSec(it) })
+        assertEquals(listOf(0, 3, 6, 12, 24, 48, 60, 60), (1..8).map { DesktopInstall.backoffSec(it) })
         assertEquals(0 to 1, DesktopInstall.nextMirror(0, 1, 6))
         assertEquals(1 to 0, DesktopInstall.nextMirror(0, 2, 6))
         assertEquals(0 to 0, DesktopInstall.nextMirror(5, 2, 6))
@@ -34,7 +34,7 @@ class DesktopInstallTest {
     }
 
     @Test fun plainLines() {
-        assertEquals("Connection dropped. Retrying (2 of 5)\u2026", DesktopInstall.retryLine(Fail.NETWORK, 2, 5, null))
+        assertEquals("Connection dropped. Retrying (2 of 12)\u2026", DesktopInstall.retryLine(Fail.NETWORK, 2, 5, null))
         assertEquals("Connection dropped. Trying another server (eu.edge.kernel.org), 3 of 5\u2026",
             DesktopInstall.retryLine(Fail.NETWORK, 3, 5, "eu.edge.kernel.org"))
         assertTrue(DesktopInstall.failLine(Fail.NETWORK, "").contains("tap Start to carry on"))
@@ -83,7 +83,7 @@ class DesktopInstallTest {
         assertTrue(tvnc[1].contains("apk \$T update"))                 // refreshes the list after a failure
         assertEquals(listOf(3_000L, 6_000L), waits)
         assertEquals(listOf(1), mirrors)
-        assertTrue(lines.contains("Connection dropped. Retrying (2 of 5)\u2026"))
+        assertTrue(lines.contains("Connection dropped. Retrying (2 of 12)\u2026"))
         assertTrue(lines.any { it.startsWith("Connection dropped. Trying another server (eu.edge.kernel.org)") })
         // The first batch (done before the drops) isn't redone.
         assertEquals(DesktopPlan.BATCHES.size + 2 + 2, calls)

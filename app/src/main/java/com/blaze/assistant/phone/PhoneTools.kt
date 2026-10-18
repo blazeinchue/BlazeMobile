@@ -28,7 +28,8 @@ object PhoneTools {
             JSONObject().put("app_name", p("string", "App name as shown on the home screen")), listOf("app_name")))
         put(fn("read_screen", "Read what is currently on the screen: the foreground app and a numbered list of elements. Call this before tapping or typing, and again after acting to check the result."))
         if (android.os.Build.VERSION.SDK_INT >= 30)
-            put(fn("look_at_screen", "Take a screenshot and look at it. Use when read_screen isn't enough: images, maps, games, video, or to check how something looks."))
+            put(fn("look_at_screen", "Look at the screen. Returns the screen as text when that says enough (fast); set pixels=true for a real screenshot when you must see images, maps, games, video, or how something looks.",
+                JSONObject().put("pixels", p("boolean", "true = always take a screenshot")), emptyList()))
         put(fn("tap", "Tap an element from the latest screen by its number, or by its visible text with 'text' (safer when numbers may be stale).",
             JSONObject().put("element", p("integer", "Element number"))
                 .put("text", p("string", "Visible text or description of the element, instead of a number"))
@@ -110,6 +111,14 @@ object PhoneTools {
                     val url = if (raw.startsWith("http://") || raw.startsWith("https://")) raw
                     else if (raw.contains('.') && !raw.contains(' ')) "https://$raw"
                     else "https://www.google.com/search?q=" + Uri.encode(raw)
+                    // v0.33.3: a Play Store page for an app that is installed opens the app instead; a details link
+                    // for an app that isn't there is checked first (a guessed id shows "Item not found").
+                    AppFinder.playId(url)?.let { id ->
+                        if (InstalledApps.launch(ctx, id)) return "That app ($id) is installed, so I opened it instead of the Play Store. Never offer to install it."
+                        if (kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { playMissing(id) })
+                            return "There is no Play Store app with the id $id (a guessed id). Don't guess ids: open a Play Store search instead, " +
+                                "https://play.google.com/store/search?q=<name>&c=apps, or check installed apps with list_apps."
+                    }
                     start(ctx, Intent(Intent.ACTION_VIEW, Uri.parse(url)))
                     "Opened $url"
                 }
@@ -168,6 +177,13 @@ object PhoneTools {
         return svc.screenshot() ?: "Couldn't take a screenshot (some apps block it)."
     }
 
+    /** True only when Play answers 404 for this id (network trouble or anything else = not proven missing). */
+    private fun playMissing(id: String): Boolean = try {
+        val c = java.net.URL("https://play.google.com/store/apps/details?id=" + Uri.encode(id) + "&hl=en").openConnection() as java.net.HttpURLConnection
+        c.connectTimeout = 5000; c.readTimeout = 5000; c.instanceFollowRedirects = true; c.requestMethod = "GET"
+        try { c.responseCode == 404 } finally { c.disconnect() }
+    } catch (_: Exception) { false }
+
     private fun start(ctx: Context, i: Intent) {
         i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         ctx.startActivity(i)
@@ -177,6 +193,9 @@ object PhoneTools {
         val pm = ctx.packageManager
         val launcher = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
         val apps = pm.queryIntentActivities(launcher, 0)
+        AppFinder.pkgIn(name)?.let { p -> pm.getLaunchIntentForPackage(p)?.let { i ->
+            start(ctx, i); BlazeAccessibilityService.instance?.settle(maxMs = 2000, quietMs = 300) ?: delay(900)
+            return "Opened $p. It is installed, so never offer to install it." } }
         val q = AppMatch.clean(name)
         if (q.isEmpty()) return "Couldn't tell which app '$name' means. Ask the user, or use the earlier context."
         val scored = apps.map { it to it.loadLabel(pm).toString() }
@@ -185,13 +204,16 @@ object PhoneTools {
             // "whatsapp settings" contains both "WhatsApp" and "Settings": never let the generic Settings app win a partial match.
             .filter { it.third == 0 || q == "settings" || it.second.lowercase() != "settings" }
             .sortedWith(compareBy({ it.third }, { -it.second.length }))
-        val best = scored.firstOrNull()
-            ?: return "No app called '$name' is installed. Installed apps include: " +
-                apps.map { it.loadLabel(pm).toString() }.sorted().take(60).joinToString(", ")
-        val intent = pm.getLaunchIntentForPackage(best.first.activityInfo.packageName)
+        // v0.33.3: a package in the ask (a quoted app tile) or a fuzzy match (label words, package parts, category) next.
+        val best = scored.firstOrNull()?.let { it.first.activityInfo.packageName to it.second }
+            ?: kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { AppFinder.resolve(name, InstalledApps.all(ctx)) }?.let { it.pkg to it.label }
+            ?: return "No installed app matches '$name' (checked every launchable app by name, package and category). Installed apps include: " +
+                apps.map { it.loadLabel(pm).toString() }.sorted().take(60).joinToString(", ") +
+                ". Only if the user wants to get it: open a Play Store SEARCH (https://play.google.com/store/search?q=...&c=apps), never a guessed details?id= link."
+        val intent = pm.getLaunchIntentForPackage(best.first)
             ?: return "Couldn't open ${best.second}."
         start(ctx, intent)
         BlazeAccessibilityService.instance?.settle(maxMs = 2000, quietMs = 300) ?: delay(900)
-        return "Opened ${best.second}."
+        return "Opened ${best.second} (${best.first}). It is installed, so never offer to install it."
     }
 }

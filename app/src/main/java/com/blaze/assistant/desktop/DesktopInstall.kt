@@ -11,7 +11,8 @@ import com.blaze.assistant.terminal.AlpineNet
  * shell runner, the status line and the sleep are passed in.
  */
 object DesktopInstall {
-    const val TRIES = 5
+    /** v0.33.3: 12 tries per step (was 5); every try resumes, so a flaky connection only costs time. */
+    const val TRIES = 12
 
     enum class Fail { NETWORK, SPACE, MISSING, OTHER }
 
@@ -27,8 +28,8 @@ object DesktopInstall {
         else -> Fail.OTHER
     }
 
-    /** Seconds before try [attempt] (2 → 3 s, 3 → 6, 4 → 12, 5 → 24, then 30). */
-    fun backoffSec(attempt: Int): Int = if (attempt <= 1) 0 else minOf(30, 3 shl (attempt - 2))
+    /** Seconds before try [attempt] (2 → 3 s, 3 → 6, 4 → 12, 5 → 24, 6 → 48, then 60). */
+    fun backoffSec(attempt: Int): Int = if (attempt <= 1) 0 else minOf(60, 3 shl minOf(attempt - 2, 8))
 
     /** After a failure on mirror [cur] that has now failed [failsHere] times in a row: which mirror next, and its count. */
     fun nextMirror(cur: Int, failsHere: Int, size: Int): Pair<Int, Int> =
@@ -66,7 +67,8 @@ object DesktopInstall {
      * [mirrors] defaults to [AlpineNet.MIRRORS]; [startMirror] is where the last install got to.
      */
     fun run(exec: (String, (String) -> Unit) -> Result, status: (Int?, String) -> Unit, sleep: (Long) -> Unit,
-            mirrors: List<String> = AlpineNet.MIRRORS, startMirror: Int = 0, tries: Int = TRIES, onMirror: (Int) -> Unit = {}): String? {
+            mirrors: List<String> = AlpineNet.MIRRORS, startMirror: Int = 0, tries: Int = TRIES, onMirror: (Int) -> Unit = {},
+            prefetch: ((mirror: Int, pkgs: List<String>, update: Boolean) -> List<DesktopPrefetch.Pkg>?)? = null): String? {
         val steps: List<List<String>> = listOf(emptyList<String>()) + DesktopPlan.BATCHES
         val n = steps.size + 1
         var mirror = startMirror.coerceIn(0, (mirrors.size - 1).coerceAtLeast(0))
@@ -76,7 +78,11 @@ object DesktopInstall {
             var attempt = 1
             while (true) {
                 status(pct(i, n, 0), if (pkgs.isEmpty()) "Checking what to download\u2026" else "Downloading " + pkgs.joinToString(", ") + "\u2026")
-                val r = exec(DesktopPlan.stepScript(mirrors[mirror], pkgs, update = needUpdate || pkgs.isEmpty())) { line ->
+                // v0.33.3: Blaze downloads the batch's packages itself (resumable) once the package list is fresh.
+                // null = the prefetch couldn't run (old path); a list (even empty) = the package list is fresh now.
+                val pre = if (pkgs.isNotEmpty() && prefetch != null) try { prefetch(mirror, pkgs, needUpdate) } catch (_: Exception) { null } else null
+                val staged = pre.orEmpty()
+                val r = exec(DesktopPlan.stepScript(mirrors[mirror], pkgs, update = (needUpdate && pre == null) || pkgs.isEmpty(), staged = staged)) { line ->
                     DesktopPlan.progressLine(line)?.let { (p, words) -> if (p != null && p < 100) status(pct(i, n, p), words) }
                 }
                 if (r.code == 0 && "BLAZE_STEP_OK" in r.tail) { needUpdate = false; failsHere = 0; break }

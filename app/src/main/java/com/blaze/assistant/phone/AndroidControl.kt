@@ -57,8 +57,9 @@ object AndroidControl {
             JSONObject().put("action", en("power_dialog", "split_screen", "screenshot", "lock", "recents", "notifications", "quick_settings")), listOf("action")),
         fn("app_usage", "Which apps were used most today/this week (needs Usage access).", JSONObject().put("days", JSONObject().put("type", "integer")), emptyList()),
         fn("uninstall_app", "Ask Android to uninstall an app (the user confirms).", JSONObject().put("package", str("Package name")), listOf("package")),
-        fn("list_apps", "List the apps installed on this phone (name and package), optionally filtered by a word. Use it instead of asking the user what they have.",
-            JSONObject().put("filter", str("Optional word, e.g. 'bank', 'secure', 'whatsapp'")), emptyList()),
+        fn("list_apps", "List the apps installed on this phone (name, package, game or not); the chat shows them as a tappable card. Without a filter: every launchable app. " +
+            "The filter matches loosely: words of the name or package, partial words, and categories ('car rally game', 'music', 'maps'). Use it before saying an app isn't installed, and instead of asking the user what they have.",
+            JSONObject().put("filter", str("Optional words, e.g. 'rally game', 'bank', 'whatsapp'")), emptyList()),
         fn("open_camera", "Open the phone's own camera app for the user (photo or video, saved to their gallery), or scan a QR code. To SEE something yourself use blaze_camera instead.", JSONObject().put("mode", en("photo", "video", "qr")), emptyList()),
         fn("blaze_camera", "Open Blaze Camera so the user can show you something. The capture comes back into this chat as their next message. Modes: ask (look at a thing and answer), photo, text (read words, on-device OCR), translate (read words and translate them), scan (QR code / barcode), document (scan a page, crop and clean it).",
             JSONObject().put("mode", en("ask", "photo", "text", "translate", "scan", "document")), listOf("mode")),

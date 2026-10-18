@@ -235,6 +235,11 @@ object BrowserEngine {
         } catch (_: Throwable) { }
     }
 
+    /** v0.33.3: a transparent 84px spacer at the end of a scrollable page (once), so the floating toolbar never hides its end. */
+    const val BOTTOM_PAD_JS = "(function(){try{var b=document.body;if(!b||document.getElementById('__blaze_pad'))return;" +
+        "if(document.documentElement.scrollHeight<=window.innerHeight+4)return;var d=document.createElement('div');d.id='__blaze_pad';" +
+        "d.setAttribute('aria-hidden','true');d.style.cssText='display:block;height:84px;width:1px;clear:both;pointer-events:none;background:transparent';b.appendChild(d);}catch(e){}})()"
+
     // ---------- tabs ----------
     @SuppressLint("SetJavaScriptEnabled")
     fun newTab(ctx: Context, url: String? = null, isPrivate: Boolean = false, restore: TabStore.Snap? = null): Tab {
@@ -268,17 +273,11 @@ object BrowserEngine {
                 return true
             }
             override fun shouldOverrideUrlLoading(v: WebView, r: WebResourceRequest): Boolean {
-                val u = r.url
-                if (u.scheme == "http" || u.scheme == "https" || u.scheme == "about" || u.scheme == "data" || u.scheme == "blob") return false
-                // Apps and intents: whatsapp:, tel:, mailto:, intent://, market:…
-                try {
-                    val i = if (u.scheme == "intent") Intent.parseUri(u.toString(), Intent.URI_INTENT_SCHEME) else Intent(Intent.ACTION_VIEW, u)
-                    i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK); i.addCategory(Intent.CATEGORY_BROWSABLE); i.component = null; i.selector = null
-                    app.startActivity(i)
-                } catch (_: Exception) {
-                    if (u.scheme == "intent") Intent.parseUri(u.toString(), Intent.URI_INTENT_SCHEME).getStringExtra("browser_fallback_url")?.let { v.loadUrl(it) }
-                }
-                return true
+                // v0.33.3: intent://, other apps' schemes (market:, mailto:, tel:, hark:…) and cross-site https App Links
+                // (link taps, server redirects, JS / meta-refresh redirects) open the app that handles them; a page with
+                // no app for it just keeps loading (AppLinks / RedirectRules).
+                // An agent driving a background tab stays in the page: only the tab on screen hands https links to apps.
+                return AppLinks.handle(app, v, r, t.url.ifBlank { v.url }, appLinks = visible(t))
             }
             override fun onPageStarted(v: WebView, url: String?, favicon: Bitmap?) {
                 t.url = url.orEmpty(); t.progress = 5
@@ -294,6 +293,8 @@ object BrowserEngine {
             override fun onPageFinished(v: WebView, url: String?) {
                 t.url = url.orEmpty(); t.progress = 100; t.canBack = v.canGoBack(); t.canForward = v.canGoForward()
                 t.loaded.complete(Unit)
+                // v0.33.3: room under the page for the floating toolbar, so the last lines can scroll above it.
+                if (url.orEmpty().startsWith("http")) v.evaluateJavascript(BOTTOM_PAD_JS, null)
                 if (!t.isPrivate && !url.isNullOrBlank() && url != "about:blank" && !SavedPages.isSavedUrl(url)) BrowserData.addHistory(app, v.title ?: url, url)
                 if (!t.isPrivate) {
                     if (captureLate) v.evaluateJavascript(BrowserLogins.CAPTURE_JS, null)

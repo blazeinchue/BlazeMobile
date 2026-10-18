@@ -119,7 +119,36 @@ object LinuxDesktop {
             sleep = { ms -> Thread.sleep(ms) },
             startMirror = start,
             onMirror = { Settings.setStr(PREF_MIRROR, it.toString()) },
+            prefetch = { mirror, pkgs, update -> prefetch(mirror, pkgs, update) },
         )
+    }
+
+    /**
+     * v0.33.3: downloads a batch's missing packages with [com.blaze.assistant.terminal.Fetch] (resumable, many retries,
+     * mirrors) into the rootfs stage folder. Null when apk couldn't say what is missing (the step then uses plain apk add).
+     */
+    private fun prefetch(mirror: Int, pkgs: List<String>, update: Boolean): List<DesktopPrefetch.Pkg>? {
+        val mirrors = com.blaze.assistant.terminal.AlpineNet.MIRRORS
+        val full = StringBuilder()
+        val sim = runStep(DesktopPrefetch.simulateScript(mirrors[mirror], pkgs, update)) { full.append(it).append('\n') }
+        if (sim.code != 0 || "BLAZE_SIM_OK" !in sim.tail) return null
+        val list = DesktopPrefetch.parseSimulate(full.toString())
+        if (list.isEmpty()) return emptyList()
+        val arch = com.blaze.assistant.terminal.AlpineNet.arch(android.os.Build.SUPPORTED_ABIS.firstOrNull())
+        val stage = File(Linux.rootfs(), DesktopPrefetch.STAGE).also { it.mkdirs() }
+        var done = 0L
+        list.forEachIndexed { i, p ->
+            val dest = File(stage, p.file)
+            if (dest.isFile && dest.length() > 0) { done += dest.length(); return@forEachIndexed }
+            val resuming = File(dest.path + ".part").let { it.exists() && it.length() > 0 }
+            val base = done
+            com.blaze.assistant.terminal.Fetch.download(DesktopPrefetch.urls(p, arch, mirrors, mirror), dest, "",
+                progress = { got, _, retry ->
+                    set(Phase.INSTALLING, retry ?: DesktopPrefetch.batchLine(p, i, list.size, base + got, resuming), _state.value.pct)
+                })
+            done += dest.length()
+        }
+        return list
     }
 
     /** Runs one install step inside Alpine, streaming its output; never throws. */

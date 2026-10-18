@@ -14,12 +14,24 @@ import java.security.MessageDigest
  * SHA-256 before handing over the file. Plain JVM (java.net), no Android.
  */
 object Fetch {
-    const val TRIES = 6
-    const val CONNECT_TIMEOUT_MS = 20_000
-    const val READ_TIMEOUT_MS = 45_000
+    /** v0.33.3: many more tries (a flaky mobile connection drops a dozen times in 260 MB); each resumes, so they are cheap. */
+    const val TRIES = 14
+    const val CONNECT_TIMEOUT_MS = 25_000
+    const val READ_TIMEOUT_MS = 90_000
 
-    /** Seconds to wait before try [attempt] (1-based; the first try doesn't wait): 2, 4, 8, 16, then 30. */
-    fun backoffSec(attempt: Int): Int = if (attempt <= 1) 0 else minOf(30, 1 shl (attempt - 1))
+    /** Seconds to wait before try [attempt] (1-based; the first try doesn't wait): 2, 4, 8, 16, 32, then 60. */
+    fun backoffSec(attempt: Int): Int = if (attempt <= 1) 0 else minOf(60, 1 shl minOf(attempt - 1, 10))
+
+    /** v0.33.3: the plain progress line in MB ("Resuming… 12.3 of 48.0 MB", "Downloading… 3.1 MB"). */
+    fun mbLine(what: String, got: Long, total: Long, resuming: Boolean): String {
+        fun mb(b: Long) = "%.1f".format(java.util.Locale.US, b / 1_000_000.0)
+        val verb = if (resuming) "Resuming" else "Downloading"
+        val w = if (what.isBlank()) "" else " $what"
+        return if (total > 0) "$verb$w\u2026 ${mb(got)} of ${mb(total)} MB" else "$verb$w\u2026 ${mb(got)} MB"
+    }
+
+    /** True when an HTTP error means "not on this server" (try the next URL now, no wait, no retry here). */
+    fun notHere(code: Int): Boolean = code == 404 || code == 410
 
     /** Which mirror try [attempt] uses: two tries each, then the next one, wrapping round. */
     fun mirrorIndex(attempt: Int, mirrors: Int): Int = if (mirrors <= 0) 0 else ((attempt - 1).coerceAtLeast(0) / 2) % mirrors
@@ -71,9 +83,14 @@ object Fetch {
         dest.parentFile?.mkdirs()
         if (dest.exists() && (sha256.isBlank() || sha256(dest) == sha256)) return dest
         var last: Throwable? = null
+        // v0.33.3: a URL that answers 404 / 410 is skipped at once (a package is in main OR community); others get two
+        // tries each, then the next mirror, wrapping round. Every try resumes from the .part file.
+        var idx = 0; var failsHere = 0; val missing = HashSet<Int>()
+        fun advance() { var k = 0; do { idx = (idx + 1) % urls.size; k++ } while (idx in missing && k <= urls.size); failsHere = 0 }
         for (attempt in 1..tries) {
-            val url = urls[mirrorIndex(attempt, urls.size)]
-            if (attempt > 1) {
+            val url = urls[idx]
+            val prev = last
+            if (attempt > 1 && prev != null && !(prev is HttpException && notHere(prev.code))) {
                 val wait = backoffSec(attempt)
                 progress.on(part.length(), -1, "${reason(last!!)}. Retrying ($attempt of $tries)\u2026")
                 if (wait > 0) sleep(wait * 1000L)
@@ -87,7 +104,14 @@ object Fetch {
             } catch (e: HttpException) {
                 last = e
                 if (e.code == 416) part.delete()   // what we have is bigger than the file: start over
-            } catch (e: Exception) { last = e }
+                if (notHere(e.code)) {
+                    missing += idx
+                    if (missing.size >= urls.size) throw e   // nowhere has it: no point retrying
+                    advance(); continue
+                }
+                failsHere++
+            } catch (e: Exception) { last = e; failsHere++ }
+            if (failsHere >= 2 && urls.size - missing.size > 1) advance()
         }
         throw last ?: IOException("download failed")
     }

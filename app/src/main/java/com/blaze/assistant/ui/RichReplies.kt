@@ -32,6 +32,8 @@ object RichReplies {
         @androidx.compose.runtime.Immutable data class Compare(val compare: RichKit.Compare) : Block()
         /** v0.28.1: a table card (```table, or a Markdown pipe table). */
         @androidx.compose.runtime.Immutable data class Table(val table: RichKit.TableCard, val raw: String) : Block()
+        /** v0.33.3: the user's installed apps as a tappable grid (```apps, added by list_apps). */
+        @androidx.compose.runtime.Immutable data class Apps(val apps: RichKit.AppsCard) : Block()
         /**
          * A visual still streaming in (its fence isn't closed and it can't be drawn yet). Shown as a quiet placeholder
          * while the reply streams; [fallback] once the reply is done (a reply that never closed its fence).
@@ -127,6 +129,7 @@ object RichReplies {
                 "tool" -> RichKit.tool(s.code)?.let { Block.Tool(it) }
                 "compare" -> RichKit.compare(s.code)?.let { Block.Compare(it) }
                 "table" -> RichKit.table(s.code)?.let { Block.Table(it, s.raw) }
+                "apps" -> RichKit.apps(s.code)?.let { Block.Apps(it) }
                 else -> null
             }
         } catch (_: Exception) { null } catch (_: StackOverflowError) { null }
@@ -141,6 +144,7 @@ object RichReplies {
         "tool" -> "Building a calculator\u2026"
         "form" -> "Making a quick form\u2026"
         "diagram" -> "Drawing a diagram\u2026"
+        "apps" -> "Laying out your apps\u2026"
         else -> "Adding options\u2026"
     }
 

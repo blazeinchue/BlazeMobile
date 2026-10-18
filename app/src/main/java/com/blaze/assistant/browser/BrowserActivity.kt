@@ -57,6 +57,7 @@ import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material3.Icon
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.semantics.contentDescription
@@ -250,8 +251,12 @@ internal fun BrowserScreen(onClose: () -> Unit, onImport: () -> Unit, onPopOut: 
             isPrivate = priv)
     }
 
-    Column(Modifier.fillMaxSize().background(bg).systemBarsPadding().imePadding()) {
+    // v0.33.3: the floating toolbar hides on scroll down and comes back on scroll up (or a tap on the page top).
+    var barShown by remember { mutableStateOf(true) }
+    LaunchedEffect(tab?.id, tab?.url) { barShown = true }
+    Column(Modifier.fillMaxSize().background(bg).statusBarsPadding().imePadding()) {
         // Address row: close, privacy, the address pill, reload, ask.
+        Box(Modifier.fillMaxWidth()) {
         Row(Modifier.fillMaxWidth().padding(start = 10.dp, end = 10.dp, top = 8.dp, bottom = 6.dp), verticalAlignment = Alignment.CenterVertically) {
             GlassIconButton(Icons.Rounded.Close, "Close browser", size = 38.dp, onClick = onClose)
             Spacer(Modifier.width(6.dp))
@@ -291,45 +296,19 @@ internal fun BrowserScreen(onClose: () -> Unit, onImport: () -> Unit, onPopOut: 
             GlassIconButton(Icons.Rounded.AutoAwesome, "Ask Blaze about this page", size = 38.dp, bg = Glass.blue,
                 enabled = tab?.url.orEmpty().startsWith("http") || previewPage != null) { askFirst = null; askOpen = true }
         }
-        BrandProgress(tab?.progress ?: 100, Modifier.padding(horizontal = 14.dp))
-        // v0.29.1: show what the page is pulling, so a slow network still looks alive.
-        tab?.let { tb ->
-            if (tb.progress in 0..99) {
-                var now by remember { mutableStateOf(System.currentTimeMillis()) }
-                LaunchedEffect(tb.id, tb.loadStart) { while (true) { now = System.currentTimeMillis(); kotlinx.coroutines.delay(500) } }
-                val host = LoadFeed.label(tb.url).substringBefore(" ›")
-                androidx.compose.material3.Text(LoadFeed.line(tb.progress, tb.pulls, tb.pulling, host, tb.loadStart, tb.lastPull, now),
-                    color = Glass.sub, fontSize = 11.sp, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
-                    fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 3.dp))
-            }
-        }
-        // Rounded tab chips (only with more than one tab of this kind).
-        val sameKind = BrowserEngine.tabs.filter { it.isPrivate == priv }
-        if (sameKind.size > 1) {
-            Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 10.dp, vertical = 6.dp),
-                horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                sameKind.forEach { t ->
-                    val on = t === tab
-                    Row(Modifier.height(32.dp).widthIn(max = 170.dp).clip(Glass.pill).background(if (on) Glass.raised2 else Glass.surface)
-                        .border(1.dp, if (on) Glass.blue.copy(alpha = 0.6f) else Glass.border, Glass.pill)
-                        .clickable { BrowserEngine.current = BrowserEngine.tabs.indexOf(t) }.padding(start = 12.dp, end = 4.dp),
-                        verticalAlignment = Alignment.CenterVertically) {
-                        Text(t.title.ifBlank { display(t.url) }.ifBlank { "New tab" }, if (on) Glass.text else Glass.sub, 12, maxLines = 1, modifier = Modifier.weight(1f, fill = false))
-                        Icon(Icons.Rounded.Close, "Close tab", tint = Glass.weak, modifier = Modifier.size(24.dp).clip(CircleShape)
-                            .clickable { BrowserEngine.close(BrowserEngine.tabs.indexOf(t)); if (BrowserEngine.tabs.none { it.isPrivate == priv }) BrowserEngine.newTab(ctx, isPrivate = priv) }.padding(5.dp))
-                    }
-                }
-            }
+        // v0.33.3: no status line and no tab pills (the tabs button keeps the count); just a 2dp progress line laid
+        // over the bottom edge of the address row, taking no layout space.
+        if ((tab?.progress ?: 100) in 0..99) ThinProgress(tab?.progress ?: 100, Modifier.align(Alignment.BottomCenter).padding(horizontal = 22.dp))
         }
 
-        Box(Modifier.weight(1f).fillMaxWidth().padding(horizontal = 6.dp).clip(RoundedCornerShape(20.dp)).background(Color.White)) {
+        Box(Modifier.weight(1f).fillMaxWidth()) {
+        Box(Modifier.fillMaxSize().padding(horizontal = 6.dp).clip(RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp, bottomStart = 28.dp, bottomEnd = 28.dp)).background(Color.White)) {
             if (previewPage != null) {
                 previewPage()
                 if (pointer) PagePointerLayer(null, host, onClose = { pointer = false }, preview = previewPointer, previewMenu = previewMenu, startTip = previewTip)
             } else if (tab != null) {
                 val blank = tab.url.isBlank() || tab.url == "about:blank"
-                key(tab.id) { WebHost(tab) }
+                key(tab.id) { WebHost(tab, onScroll = { down -> if (panel == Panel.NONE) barShown = !down }) }
                 if (blank) StartPage(tick) { u -> BrowserEngine.load(tab, u); panel = Panel.NONE }
                 if (pointer) PagePointerLayer(tab.web, host, onClose = { pointer = false })
                 // v0.29.7 saved passwords: offer to save after a sign-in, or offer saved accounts on a sign-in form.
@@ -340,6 +319,8 @@ internal fun BrowserScreen(onClose: () -> Unit, onImport: () -> Unit, onPopOut: 
                     else if (tab.fillAccounts.isNotEmpty()) LoginFillBar(tab.fillAccounts, onPick = { BrowserEngine.fillLogin(tab, it) }, onDismiss = { tab.fillAccounts = emptyList() })
                 }
             }
+            val navBottom = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
+            androidx.compose.runtime.CompositionLocalProvider(LocalSheetInset provides (72.dp + navBottom)) {
             when (panel) {
                 Panel.TABS, Panel.NONE -> {}
                 Panel.PRIVACY -> Sheet { PrivacySheet(onImport = onImport, onPrivateTab = { BrowserEngine.newTab(ctx, isPrivate = true); panel = Panel.NONE }) }
@@ -395,20 +376,28 @@ internal fun BrowserScreen(onClose: () -> Unit, onImport: () -> Unit, onPopOut: 
                     MenuRow(Icons.Rounded.DeleteSweep, "Clear history") { BrowserData.clearHistory(ctx); panel = Panel.NONE }
                 }
             }
+            }
         }
 
-        // Bottom bar: back, forward, home, the mascot (pointer), tabs, menu.
-        Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically,
+        // v0.33.3: the bottom bar is a floating glass pill over the page (no layout space), inset from the edges and the
+        // nav bar; it slides away on scroll down and back on scroll up, and always shows while a panel is open.
+        val showBar = barShown || panel != Panel.NONE || pointer || tab?.url.isNullOrBlank() || tab?.url == "about:blank"
+        val hide by androidx.compose.animation.core.animateFloatAsState(if (showBar) 0f else 1f, androidx.compose.animation.core.tween(220), label = "bar")
+        Row(Modifier.align(Alignment.BottomCenter)
+            .graphicsLayer { translationY = hide * (size.height + 48.dp.toPx()); alpha = 1f - hide }
+            .navigationBarsPadding().padding(start = 14.dp, end = 14.dp, bottom = 10.dp).fillMaxWidth()
+            .shadow(16.dp, Glass.pill).clip(Glass.pill).background(Glass.surface.copy(alpha = 0.93f)).border(1.dp, Glass.border, Glass.pill)
+            .padding(horizontal = 8.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween) {
             GlassIconButton(Icons.AutoMirrored.Rounded.ArrowBack, "Back", size = 42.dp, bg = Color.Transparent, enabled = tab?.canBack == true) { tab?.web?.goBack() }
             GlassIconButton(Icons.Rounded.ArrowForward, "Forward", size = 42.dp, bg = Color.Transparent, enabled = tab?.canForward == true) { tab?.web?.goForward() }
             GlassIconButton(Icons.Rounded.Home, "Start page", size = 42.dp, bg = Color.Transparent) { tab?.let { BrowserEngine.load(it, "about:blank") }; panel = Panel.NONE; pointer = false }
-            Box(Modifier.size(50.dp).clip(CircleShape).background(if (pointer) Glass.raised2 else Glass.raised)
+            Box(Modifier.size(46.dp).clip(CircleShape).background(if (pointer) Glass.raised2 else Glass.raised)
                 .border(1.dp, if (pointer) Glass.blue else Glass.border, CircleShape)
                 .combinedClickable(onClick = { pointer = !pointer; panel = Panel.NONE }, onLongClick = { pointer = true; panel = Panel.NONE },
                     onClickLabel = if (pointer) "Put the Blaze pointer away" else "Summon the Blaze pointer")
                 .semantics { contentDescription = if (pointer) "Put the Blaze pointer away" else "Summon the Blaze pointer" }, contentAlignment = Alignment.Center) {
-                MascotGlyph(40.dp, pulse = pointer)
+                MascotGlyph(36.dp, pulse = pointer)
             }
             Box(Modifier.size(42.dp).clip(CircleShape).clickable { BrowserEngine.snapshot(); panel = Panel.TABS }
                 .semantics { contentDescription = "Tabs" }, contentAlignment = Alignment.Center) {
@@ -418,6 +407,7 @@ internal fun BrowserScreen(onClose: () -> Unit, onImport: () -> Unit, onPopOut: 
             }
             GlassIconButton(Icons.Rounded.MoreHoriz, "Menu", size = 42.dp, bg = Color.Transparent) { panel = if (panel == Panel.MENU) Panel.NONE else Panel.MENU }
         }
+        }
     }
 
     if (askOpen) PageAskSheet(title = tab?.title.orEmpty(), initial = askFirst,
@@ -426,9 +416,14 @@ internal fun BrowserScreen(onClose: () -> Unit, onImport: () -> Unit, onPopOut: 
 }
 
 @Composable
-private fun WebHost(tab: BrowserEngine.Tab) {
+private fun WebHost(tab: BrowserEngine.Tab, onScroll: ((down: Boolean) -> Unit)? = null) {
+    val cb = androidx.compose.runtime.rememberUpdatedState(onScroll)
     AndroidView(factory = { FrameLayout(it) }, update = { f ->
         val w = tab.web
+        if (onScroll != null) w.setOnScrollChangeListener { _, _, y, _, oldY ->
+            val d = ToolbarScroll.direction(y, oldY)
+            if (d != null) cb.value?.invoke(d)
+        } else w.setOnScrollChangeListener(null)
         if (w.parent !== f) { (w.parent as? ViewGroup)?.removeView(w); f.removeAllViews(); f.addView(w, FrameLayout.LayoutParams(-1, -1)) }
         // v0.30.5: Home's live preview shows this page scaled down; full size here.
         if (w.scaleX != 1f || w.scaleY != 1f) { w.scaleX = 1f; w.scaleY = 1f }
@@ -493,11 +488,14 @@ private fun StartPage(tick: Int, open: (String) -> Unit) {
     }
 }
 
+/** v0.33.3: room under a sheet for the floating toolbar (the browser provides it; 0 elsewhere). */
+internal val LocalSheetInset = androidx.compose.runtime.compositionLocalOf { 0.dp }
+
 @Composable internal fun Sheet(content: @Composable ColumnScope.() -> Unit) {
     val shape = RoundedCornerShape(topStart = 26.dp, topEnd = 26.dp)
     Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.4f)), contentAlignment = Alignment.BottomCenter) {
         Column(Modifier.fillMaxWidth().shadow(18.dp, shape).clip(shape).background(Glass.surface).border(1.dp, Glass.border, shape)
-            .padding(top = 10.dp, bottom = 8.dp), content = content)
+            .padding(top = 10.dp, bottom = 8.dp + LocalSheetInset.current), content = content)
     }
 }
 
@@ -514,3 +512,22 @@ private fun StartPage(tick: Int, open: (String) -> Unit) {
 @Composable private fun Text(s: String, color: androidx.compose.ui.graphics.Color, size: Int, modifier: Modifier = Modifier, maxLines: Int = Int.MAX_VALUE, weight: FontWeight = FontWeight.Normal) =
     androidx.compose.material3.Text(s, modifier = modifier, maxLines = maxLines, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
         style = TextStyle(fontFamily = if (size >= 20) Type.Display else Type.Sans, fontWeight = weight, fontSize = size.sp, color = color))
+
+/** v0.33.3: a 2dp progress line (brand gradient, rounded), overlaid on the address row's bottom edge. */
+@Composable
+private fun ThinProgress(progress: Int, modifier: Modifier = Modifier) {
+    Box(modifier.fillMaxWidth().height(2.dp).clip(Glass.pill)) {
+        Box(Modifier.fillMaxWidth(progress.coerceIn(5, 100) / 100f).fillMaxHeight().clip(Glass.pill).background(Glass.brand))
+    }
+}
+
+/** Pure (tested): which way a scroll moves the floating toolbar. true = down (hide), false = up or at the top (show), null = jitter. */
+object ToolbarScroll {
+    const val SLOP = 12
+    fun direction(y: Int, oldY: Int): Boolean? = when {
+        y <= 0 -> false
+        y - oldY > SLOP -> true
+        oldY - y > SLOP -> false
+        else -> null
+    }
+}

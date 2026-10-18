@@ -1070,6 +1070,8 @@ When you finish, say what you did in one short sentence.
         var keep = false
         /** Tool names called this turn, in order (for Learn.decide). */
         val turnTools = java.util.Collections.synchronizedList(mutableListOf<String>())
+        /** v0.33.3: the ```apps card of this turn's last list_apps (added to the reply when it says it shows a list). */
+        @Volatile var turnAppsCard: String? = null
         /** v0.23.0: the view this turn must use (keyword classifier) and the skills looked up for it. */
         @Volatile var turnView: ViewRouter.Spec? = null
         @Volatile var turnSkills: SkillMatch.Result = SkillMatch.Result.NONE
@@ -2367,6 +2369,7 @@ When you finish, say what you did in one short sentence.
                 streamedVoice = false
                 while (trace.length() > 0) trace.remove(0)
                 turnTools.clear()
+                turnAppsCard = null
                 val turnThink = StringBuilder()
                 val turnStart = System.currentTimeMillis()
                 thinking = ""
@@ -2437,7 +2440,7 @@ When you finish, say what you did in one short sentence.
                     // limit is cut off and retried once on the same model. Long thinking is fine while it streams.
                     val lane = if (step == 0) LlmClient.Lane.MAIN else LlmClient.Lane.STEPS
                     val limit = Settings.str("model_timeout_s", "100").toLongOrNull()?.coerceIn(30, 600)?.times(1000) ?: 100_000L
-                    suspend fun call(r: JSONArray): JSONObject = (Agent.idleGuard(limit) { LlmClient.complete(r, tools, onText, onThink, lane) }
+                    suspend fun callPlain(r: JSONArray): JSONObject = (Agent.idleGuard(limit) { LlmClient.complete(r, tools, onText, onThink, lane) }
                         ?.also { gate.flush() })
                         ?: run {
                             gate.flush()
@@ -2446,6 +2449,26 @@ When you finish, say what you did in one short sentence.
                             Agent.idleGuard(limit) { LlmClient.complete(r, tools, onText, onThink, lane) }
                                 ?: throw LlmClient.LlmException("${LlmClient.lastRoute.ifBlank { "The model" }} sent nothing for ${limit / 1000}s, twice. Try again, or pick a faster model in Settings → AI.")
                         }
+                    suspend fun call(r0: JSONArray): JSONObject {
+                        var r = r0
+                        // v0.33.3: a call that must read a fresh screenshot gets 12 s; then the picture becomes the screen
+                        // as text and the same request goes on the gateway's text route (much faster on a slow phone/network).
+                        if (VisionFast.hasFreshShot(r, SHOT_NOTE)) {
+                            var live = true
+                            val d = kotlinx.coroutines.CoroutineScope(Dispatchers.IO).async {
+                                LlmClient.complete(r, tools, onText?.let { f -> { t: String -> if (live) f(t) } }, { t: String -> if (live) onThink(t) }, lane) }
+                            val got = try { kotlinx.coroutines.withTimeoutOrNull(VisionFast.TIMEOUT_MS) { d.await() } }
+                                catch (e: LlmClient.LlmException) { if (LlmClient.tooLarge(e)) throw e; null }
+                            if (got != null) { gate.flush(); return got }
+                            live = false; d.cancel(); gate.flush()
+                            if (liveId >= 0) { msgs = msgs.filterNot { it.id == liveId }; liveId = -1L }
+                            add(Role.STEP, "Reading the screen as text (the picture was slow)")
+                            val text = com.blaze.assistant.phone.BlazeAccessibilityService.instance?.readScreen() ?: "Phone control isn't connected, so the screen can't be read as text."
+                            r = VisionFast.withoutShots(r, SHOT_NOTE, text)
+                            VisionFast.pruneShots(history, SHOT_NOTE)
+                        }
+                        return callPlain(r)
+                    }
                     val reply = try { call(req).also { streamId = -1L } } catch (e: LlmClient.LlmException) {
                         gate.flush(); streamId = -1L
                         // v0.26.0: "too long for the model" → fold older turns into the summary (same chat, nothing
@@ -2653,6 +2676,11 @@ When you finish, say what you did in one short sentence.
                     }
                     if (calls == null || calls.length() == 0) {
                         // v0.27.x: the reply only describes what the design tool really produced (a flat diagram is not "3D").
+                        // v0.33.3: "Here's your app list" always comes with the list (the tappable app card).
+                        turnAppsCard?.let { card ->
+                            val g = com.blaze.assistant.phone.AppFinder.ensureCard(textOut, card, lastUserText())
+                            if (g != textOut) { textOut = g; reply.put("content", g) }
+                        }
                         if (Designs.touched.isNotEmpty()) {
                             val g = Designs.groundReply(textOut, Designs.touched.toList())
                             if (g != textOut) { textOut = g; reply.put("content", g) }
@@ -2753,6 +2781,8 @@ When you finish, say what you did in one short sentence.
                         if (FastActions.isScreen(result)) FastActions.pruneScreens(history)
                     }
                     if (Settings.lowData) shots.clear()
+                    // v0.33.3: a screenshot is seen by one model call only; later steps no longer re-send it (nor go to vision).
+                    VisionFast.pruneShots(history, SHOT_NOTE)
                     shots.lastOrNull()?.let { url ->
                         history.put(JSONObject().put("role", "user").put("content", JSONArray()
                             .put(JSONObject().put("type", "text").put("text", SHOT_NOTE))
@@ -2881,6 +2911,7 @@ When you finish, say what you did in one short sentence.
                     if (name == "do_actions" || (name in screenActions && !FastActions.isScreen(result))) result += screenAfter(result)
                     msgs.put(JSONObject().put("role", "tool").put("tool_call_id", call.optString("id", "s$step$i")).put("name", name).put("content", result.take(12000)))
                 }
+                VisionFast.pruneShots(msgs, SHOT_NOTE)
                 shots.lastOrNull()?.let { url -> shots.clear()
                     msgs.put(JSONObject().put("role", "user").put("content", JSONArray()
                         .put(JSONObject().put("type", "text").put("text", SHOT_NOTE))
@@ -3302,9 +3333,16 @@ When you finish, say what you did in one short sentence.
                     add(Role.STEP, "Reading the screen (low-data mode)")
                     "Low-data mode is on, so no screenshot was taken. Screen as text:\n" + (com.blaze.assistant.phone.BlazeAccessibilityService.instance?.readScreen() ?: "Phone control isn't connected.")
                 } else {
-                    add(Role.STEP, "Looking at a screenshot")
-                    val shot = PhoneTools.screenshot()
-                    if (shot.startsWith("data:")) { shots += shot; "Screenshot taken. It is attached in the next message." } else shot
+                    // v0.33.3: the accessibility tree first (instant); a picture only when it isn't enough or pixels=true.
+                    val text = if (args.optBoolean("pixels")) null else com.blaze.assistant.phone.BlazeAccessibilityService.instance?.readScreen()
+                    if (text != null && VisionFast.textEnough(text)) {
+                        add(Role.STEP, "Reading the screen")
+                        text + "\n[Read as text, which is faster than a picture. If you must see images, a game, video or a map, call look_at_screen with pixels=true.]"
+                    } else {
+                        add(Role.STEP, "Looking at a screenshot")
+                        val shot = PhoneTools.screenshot()
+                        if (shot.startsWith("data:")) { shots += shot; "Screenshot taken. It is attached in the next message." } else shot
+                    }
                 }
                 "start_agent" -> {
                     val bg = BgAgents.start(args.optString("task"), args.optString("title"), id)
@@ -3348,6 +3386,13 @@ When you finish, say what you did in one short sentence.
                             }
                         }
                     }
+                }
+                // v0.33.3: fuzzy (label + package + category), off the main thread, and the chat draws the result as a card.
+                "list_apps" -> {
+                    add(Role.STEP, "Checking your apps")
+                    val (text, card) = kotlinx.coroutines.withContext(Dispatchers.IO) { com.blaze.assistant.phone.InstalledApps.listTool(app, args.optString("filter")) }
+                    if (card != null) turnAppsCard = card
+                    text
                 }
                 in com.blaze.assistant.phone.AndroidControl.names -> {
                     add(Role.STEP, if (name == "blaze_camera") "Opening Blaze Camera" else name.replace('_', ' ').replaceFirstChar { it.uppercase() })

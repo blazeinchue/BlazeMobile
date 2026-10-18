@@ -70,7 +70,7 @@ class FetchTest {
     private fun url(p: String) = "http://127.0.0.1:$port$p"
 
     @Test fun pureBits() {
-        assertEquals(listOf(0, 2, 4, 8, 16, 30, 30), (1..7).map { Fetch.backoffSec(it) })
+        assertEquals(listOf(0, 2, 4, 8, 16, 32, 60, 60), (1..8).map { Fetch.backoffSec(it) })
         assertEquals(listOf(0, 0, 1, 1, 2, 2, 0), (1..7).map { Fetch.mirrorIndex(it, 3) })
         assertNull(Fetch.rangeHeader(0)); assertEquals("bytes=500-", Fetch.rangeHeader(500))
         assertEquals(3947906L, Fetch.totalFrom("bytes 100-199/3947906")); assertNull(Fetch.totalFrom("bytes 0-1/*"))
@@ -88,7 +88,7 @@ class FetchTest {
         assertArrayEquals(body, f.readBytes())
         assertEquals(2, ranges.size)
         assertNull(ranges[0]); assertTrue(ranges[1]!!.startsWith("bytes=")); assertTrue(ranges[1]!!.removePrefix("bytes=").removeSuffix("-").toInt() > 0)
-        assertEquals(listOf("Connection dropped. Retrying (2 of 6)\u2026"), retries)
+        assertEquals(listOf("Connection dropped. Retrying (2 of 14)\u2026"), retries)
         assertEquals(listOf(2_000L), waits)
         assertFalse(File(dir, "a.tgz.part").exists())
     }
@@ -111,5 +111,20 @@ class FetchTest {
         cutFirst = 0
         assertArrayEquals(body, Fetch.download(listOf(url("/good")), File(dir, "d.tgz"), sha, sleep = { }).readBytes())
         assertTrue(ranges.last()!!.startsWith("bytes="))
+    }
+
+    @Test fun missingEverywhereFailsFastAndMbLine() {
+        val waits = mutableListOf<Long>()
+        try { Fetch.download(listOf(url("/gone"), url("/nope")), File(dir, "e.apk"), "", sleep = { waits += it }); fail() }
+        catch (e: Fetch.HttpException) { assertEquals(404, e.code) }
+        assertTrue(waits.isEmpty())
+        assertEquals("Resuming desktop\u2026 12.3 of 48.0 MB", Fetch.mbLine("desktop", 12_300_000, 48_000_000, true))
+        assertEquals("Downloading\u2026 3.1 MB", Fetch.mbLine("", 3_100_000, -1, false))
+        assertTrue(Fetch.notHere(404)); assertTrue(Fetch.notHere(410)); assertFalse(Fetch.notHere(503))
+    }
+
+    @Test fun mainMissingThenCommunityHasIt() {
+        val f = Fetch.download(listOf(url("/gone"), url("/good")), File(dir, "f.apk"), sha, sleep = { fail("no wait after a 404") })
+        assertArrayEquals(body, f.readBytes())
     }
 }

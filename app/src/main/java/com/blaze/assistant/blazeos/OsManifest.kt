@@ -39,6 +39,10 @@ data class OsManifestData(
     val description: String = "",
     val author: String = "",
     val category: String = "",
+    /** Installed websites (v0.33.2 "Install app"): the manifest's colours ("#RRGGBB" or "") and the scope links stay in. */
+    val themeColor: String = "",
+    val backgroundColor: String = "",
+    val scope: String = "",
 )
 
 /** One App Store listing: the manifest plus where its package is and how big it is. */
@@ -83,7 +87,8 @@ object OsManifest {
         }
         val perms = strings(o.optJSONArray("permissions")).map { it.lowercase() }.filter { it in OsPerms.all }.distinct()
         return Parsed.Ok(OsManifestData(id, name, version, code, icon, entry, perms,
-            o.optString("description").trim().take(400), o.optString("author").trim().take(60), o.optString("category").trim().take(30)))
+            o.optString("description").trim().take(400), o.optString("author").trim().take(60), o.optString("category").trim().take(30),
+            color(o.optString("theme_color")), color(o.optString("background_color")), o.optString("scope").trim().takeIf { httpsUrl(it) }.orEmpty()))
     }
 
     private fun entry(e: JSONObject): OsEntry? {
@@ -134,6 +139,8 @@ object OsManifest {
         })
         .put("permissions", JSONArray(m.permissions))
         .put("description", m.description).put("author", m.author).put("category", m.category)
+        .apply { if (m.themeColor.isNotEmpty()) put("theme_color", m.themeColor); if (m.backgroundColor.isNotEmpty()) put("background_color", m.backgroundColor)
+            if (m.scope.isNotEmpty()) put("scope", m.scope) }
 
     /** -1, 0, 1 by dotted numbers ("1.10" > "1.9"). */
     fun compareVersions(a: String, b: String): Int {

@@ -194,6 +194,18 @@
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode"
             android:windowSoftInputMode="adjustResize" />
 
+        <!-- v0.33.2 an installed website as its own app: one document task per site (its own Recents entry). -->
+        <activity
+            android:name=".siteapps.SiteAppActivity"
+            android:exported="false"
+            android:label="App"
+            android:launchMode="standard"
+            android:documentLaunchMode="intoExisting"
+            android:autoRemoveFromRecents="false"
+            android:theme="@style/Theme.Blaze"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode"
+            android:windowSoftInputMode="adjustResize" />
+
         <activity
             android:name=".browser.BrowserActivity"
             android:exported="true"

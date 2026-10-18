@@ -297,6 +297,8 @@ object BlazeOs {
             size = n
         } else dir.mkdirs()
         OsDisk.writeText(File(dir, "manifest.json"), OsManifest.toJson(m).toString(1))
+        OsDisk.dataDir(app, OsApps.pkgId(m.id))
+        File(dir, "icon.png").takeIf { it.isFile }?.let { size += it.length() }
         size += File(dir, "manifest.json").length()
         when (val r = registry.value.install(m, size, q, used, System.currentTimeMillis(), preinstalled)) {
             is OsRegistry.Result.Refused -> { if (!registry.value.has(m.id)) dir.deleteRecursively(); r.why }
@@ -307,6 +309,15 @@ object BlazeOs {
                 null
             }
         }
+    }
+
+    /** v0.33.2 "Install app" from the BlazeOS Browser: a website as a BlazeOS app (hosted web entry + its icon). Null = done. */
+    suspend fun installSite(m: OsManifestData, iconPng: ByteArray): String? {
+        if (power.value != Power.ON) return "BlazeOS isn't on."
+        withContext(Dispatchers.IO) { val d = OsDisk.appDir(app, m.id); d.mkdirs(); File(d, "icon.png").writeBytes(iconPng); OsImages.forget(File(d, "icon.png").absolutePath) }
+        val why = install(OsListing(m, "", iconPng.size.toLong()))
+        if (why == null) notify("Home screen", "${m.name} was added", "It opens like an app, on its own.")
+        return why
     }
 
     /** Uninstall frees the space: the package, the app's data folder and its permission answers go. */

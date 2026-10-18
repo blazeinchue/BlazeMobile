@@ -32,6 +32,7 @@ object Views {
         BlazeView("skills", "Skills", "Skill library: on, off, restore", page = "skills"),
         BlazeView("music", "Music", "Blaze Music: your songs, playlists and a Store (Jamendo, Internet Archive" + (if (com.blaze.assistant.mediaapps.store.StoreSources.get("youtube") != null) ", YouTube" else "") + ") with downloads", special = "music", aliases = listOf("songs", "player", "music player", "playlist", "playlists")),
         BlazeView("video", "Video", "Blaze Video: your videos, continue watching, and a Store (public-domain films, Blender open movies" + (if (com.blaze.assistant.mediaapps.store.StoreSources.get("youtube") != null) ", YouTube" else "") + ")", special = "video", aliases = listOf("videos", "movies", "films", "video player")),
+        BlazeView("phone", "Phone", "BlazeOS: Blaze's own virtual phone with its own apps and App Store, fullscreen", special = "phone", aliases = listOf("blazeos", "virtual phone", "blaze os")),
         BlazeView("gallery", "Gallery", "Images, music and files Blaze made", special = "gallery"),
         BlazeView("browser", "Browser", "Blaze's own browser and tabs", special = "browser"),
         BlazeView("doctor", "Doctor", "Phone health, self-check, crash report", page = "device", aliases = listOf("device", "diagnostics")),

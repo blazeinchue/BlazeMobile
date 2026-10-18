@@ -347,6 +347,7 @@ fun ChatScreen() {
         showViews = false; showSearch = false; plusOpen = false; avatarMenu = false
         when (v.special) {
             "gallery" -> GalleryUi.open.value = true
+            "phone" -> com.blaze.assistant.blazeos.BlazeOsActivity.open(ctx)
             "projects" -> go(navNow().projectsList())
             "browser" -> com.blaze.assistant.browser.BrowserTools.show(ctx)
             "terminal" -> com.blaze.assistant.terminal.BlazeTerminalActivity.open(ctx)
@@ -383,7 +384,7 @@ fun ChatScreen() {
             if (cmdName == "views") { input = TextFieldValue(""); showViews = true; return }
             if (cmdName == "search") { input = TextFieldValue(""); showSearch = true; return }
             if (cmdName == "projects") { input = TextFieldValue(""); go(navNow().projectsList()); return }
-            if (cmdName in setOf("jobs", "schedule", "accounts", "doctor", "design", "router", "skills", "gallery", "browser", "terminal", "music", "video") && !text.contains(' ')) {
+            if (cmdName in setOf("jobs", "schedule", "accounts", "doctor", "design", "router", "skills", "gallery", "browser", "terminal", "music", "video", "phone") && !text.contains(' ')) {
                 input = TextFieldValue(""); Views.find(cmdName)?.let { openView(it) }; return
             }
         }

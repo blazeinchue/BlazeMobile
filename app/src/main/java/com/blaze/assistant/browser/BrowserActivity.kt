@@ -50,6 +50,8 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.AddToHomeScreen
+import androidx.compose.material.icons.rounded.Apps
 import androidx.compose.material.icons.rounded.*
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material3.Icon
@@ -168,7 +170,7 @@ object BrowserUi {
     @Volatile var unlockedUntil = 0L
 }
 
-private enum class Panel { NONE, TABS, MENU, BOOKMARKS, HISTORY, PRIVACY, PASSWORDS, SAVED_PAGES }
+private enum class Panel { NONE, TABS, MENU, BOOKMARKS, HISTORY, PRIVACY, PASSWORDS, SAVED_PAGES, INSTALL_SITE, SITE_APPS }
 
 /**
  * The Browser (v0.24.6 look): rounded dark Blaze theme with a pill address bar, rounded tab chips, round icon
@@ -193,6 +195,7 @@ internal fun BrowserScreen(onClose: () -> Unit, onImport: () -> Unit, onPopOut: 
     var askFirst by remember { mutableStateOf<String?>(null) }
     val pip by BrowserUi.pip
     var reading by remember { mutableStateOf<SavedPages.Page?>(null) }
+    var installUrl by remember { mutableStateOf("") }
     val priv = tab?.isPrivate == true
     val bg = if (priv) Glass.privateBg else Glass.bg
 
@@ -350,6 +353,9 @@ internal fun BrowserScreen(onClose: () -> Unit, onImport: () -> Unit, onPopOut: 
                     if (url.startsWith("http")) MenuRow(Icons.Rounded.OfflinePin, "Save page for offline") {
                         tab?.let { t -> BrowserEngine.savePage(t) { msg -> android.widget.Toast.makeText(ctx, msg, android.widget.Toast.LENGTH_SHORT).show() } }
                         panel = Panel.NONE }
+                    // v0.33.2: a site as its own app on the home screen (real icon, no browser chrome).
+                    if (url.startsWith("https://") && !priv) MenuRow(Icons.Rounded.AddToHomeScreen, "Add to Home screen / Install app") { installUrl = url; panel = Panel.INSTALL_SITE }
+                    MenuRow(Icons.Rounded.Apps, "Installed apps") { panel = Panel.SITE_APPS }
                     MenuRow(Icons.Rounded.Bookmarks, "Bookmarks") { panel = Panel.BOOKMARKS }
                     MenuRow(Icons.Rounded.LibraryBooks, "Saved pages") { panel = Panel.SAVED_PAGES }
                     MenuRow(Icons.Rounded.Key, "Saved passwords") { panel = Panel.PASSWORDS }
@@ -375,6 +381,8 @@ internal fun BrowserScreen(onClose: () -> Unit, onImport: () -> Unit, onPopOut: 
                 }
                 }
                 Panel.PASSWORDS -> Sheet { SavedPasswordsPanel() }
+                Panel.INSTALL_SITE -> Sheet { InstallSiteBody(installUrl) { panel = Panel.NONE } }
+                Panel.SITE_APPS -> Sheet { InstalledSitesBody { panel = Panel.NONE } }
                 Panel.SAVED_PAGES -> Sheet {
                     SavedPagesPanel(onOpen = { p ->
                         if (!BrowserEngine.openSaved(ctx, p)) android.widget.Toast.makeText(ctx, "That saved page is missing.", android.widget.Toast.LENGTH_SHORT).show()

@@ -129,6 +129,9 @@ fun UninstallConfirm() {
 fun OsAppHost(id: String) {
     BackHandler { BlazeOs.home() }
     val reg by BlazeOs.registry.collectAsState()
+    // An installed site's theme_color fills the status row above it, like an app's own bar.
+    val theme = if (id.startsWith(OsApps.PKG)) reg.get(id.removePrefix(OsApps.PKG))?.manifest?.themeColor.orEmpty() else ""
+    if (theme.isNotEmpty()) Box(Modifier.fillMaxSize().background(Color(parseHex(theme, 0))))
     Box(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.displayCutout).padding(top = 36.dp, bottom = 26.dp)) {
         if (id.startsWith(OsApps.BUILTIN)) when (id.removePrefix(OsApps.BUILTIN)) {
             "blaze" -> OsBlazeApp()

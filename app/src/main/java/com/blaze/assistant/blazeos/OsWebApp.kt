@@ -32,11 +32,13 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.AddToHomeScreen
 import androidx.compose.material.icons.rounded.ArrowBackIosNew
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -73,7 +75,13 @@ object OsWeb {
     fun host(manifestId: String) = manifestId.lowercase().map { if (it.isLetterOrDigit()) it else '-' }.joinToString("") + ".apps.blazeos"
     fun origin(manifestId: String) = "https://" + host(manifestId)
 
-    fun release(appId: String) { live.remove(appId)?.let { try { (it.parent as? ViewGroup)?.removeView(it); it.destroy() } catch (_: Exception) { } } }
+    /** Apps whose first page has drawn (their splash is gone). */
+    val loadedApps = kotlinx.coroutines.flow.MutableStateFlow<Set<String>>(emptySet())
+    fun loaded(appId: String) { if (appId !in loadedApps.value) loadedApps.value = loadedApps.value + appId }
+
+    fun release(appId: String) {
+        loadedApps.value = loadedApps.value - appId
+        live.remove(appId)?.let { try { (it.parent as? ViewGroup)?.removeView(it); it.destroy() } catch (_: Exception) { } } }
     fun pauseAll() { for (w in live.values) try { w.onPause() } catch (_: Exception) { } ; try { live.values.firstOrNull()?.pauseTimers() } catch (_: Exception) { } }
     fun resumeAll() { for (w in live.values) try { w.onResume() } catch (_: Exception) { } ; try { live.values.firstOrNull()?.resumeTimers() } catch (_: Exception) { } }
     fun releaseAll() { for (id in live.keys.toList()) release(id) }
@@ -177,14 +185,17 @@ fun OsWebApp(inst: OsInstalled) {
                 }
                 override fun shouldOverrideUrlLoading(view: WebView, req: WebResourceRequest): Boolean {
                     val h = req.url.host.orEmpty()
-                    val inside = if (hosted) h == hostedHost else h == OsWeb.host(m.id)
+                    val inside = if (hosted && m.scope.isNotEmpty()) com.blaze.assistant.siteapps.SiteLogic.inScope(req.url.toString(), m.scope)
+                        else if (hosted) h == hostedHost else h == OsWeb.host(m.id)
                     if (inside) return false
                     // Leaving the app: open in the BlazeOS Browser.
                     if (req.url.scheme == "https" || req.url.scheme == "http") { OsBrowser.pending.value = req.url.toString(); BlazeOs.launch("blaze:browser") }
                     return true
                 }
             }
+            w.setBackgroundColor(parseHex(m.backgroundColor, if (BlazeOs.prefs.value.dark) 0xFF000000.toInt() else 0xFFF2F2F7.toInt()))
             w.webChromeClient = object : WebChromeClient() {
+                override fun onProgressChanged(view: WebView, p: Int) { if (p >= 80) OsWeb.loaded(appId) }
                 override fun onPermissionRequest(request: PermissionRequest) {
                     val perms = request.resources.mapNotNull {
                         when (it) { PermissionRequest.RESOURCE_VIDEO_CAPTURE -> OsPerms.CAMERA; PermissionRequest.RESOURCE_AUDIO_CAPTURE -> OsPerms.MIC; else -> null }
@@ -196,7 +207,23 @@ fun OsWebApp(inst: OsInstalled) {
             w.loadUrl(if (hosted) m.entry.url else "$base/${m.entry.path}")
         }.also { web = it }
     }, onRelease = { w -> (w.parent as? ViewGroup)?.removeView(w) })
+    // A splash with the icon and name on the app's background colour until its first page has loaded (max 6 s).
+    val loaded by OsWeb.loadedApps.collectAsState()
+    var timedOut by remember { mutableStateOf(false) }
+    androidx.compose.runtime.LaunchedEffect(appId) { kotlinx.coroutines.delay(6000); timedOut = true }
+    if (appId !in loaded && !timedOut) {
+        val look = LocalOsLook.current
+        val bg = androidx.compose.ui.graphics.Color(parseHex(m.backgroundColor, if (look.dark) 0xFF000000.toInt() else 0xFFF2F2F7.toInt()))
+        Column(Modifier.fillMaxSize().background(bg), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = androidx.compose.foundation.layout.Arrangement.Center) {
+            OsAppIcon(OsApp(appId, m.name, m.entry.type, true), 96.dp)
+            Spacer(Modifier.height(14.dp))
+            Text(m.name, style = osText(look, 20f, androidx.compose.ui.text.font.FontWeight.SemiBold,
+                if (com.blaze.assistant.siteapps.SiteLogic.isDark(m.backgroundColor.ifEmpty { if (look.dark) "#000000" else "#F2F2F7" })) androidx.compose.ui.graphics.Color.White else androidx.compose.ui.graphics.Color(0xFF111114)))
+        }
+    }
 }
+
+fun parseHex(hex: String, def: Int): Int = OsIcons.parseColor(hex)?.toInt() ?: def
 
 /** What the BlazeOS Browser should open next (a link out of a web app). */
 object OsBrowser { val pending = kotlinx.coroutines.flow.MutableStateFlow("") }
@@ -208,6 +235,8 @@ fun OsBrowserApp() {
     var web by remember { mutableStateOf<WebView?>(null) }
     var address by remember { mutableStateOf("") }
     var title by remember { mutableStateOf("") }
+    var installing by remember { mutableStateOf(false) }
+    val scope = androidx.compose.runtime.rememberCoroutineScope()
     fun go(t: String) {
         val s = t.trim(); if (s.isEmpty()) return
         val url = if (Regex("^https?://", RegexOption.IGNORE_CASE).containsMatchIn(s)) s
@@ -238,6 +267,18 @@ fun OsBrowserApp() {
             }
             Spacer(Modifier.width(6.dp))
             Icon(Icons.Rounded.Refresh, "Reload", tint = look.accent, modifier = Modifier.size(34.dp).clip(CircleShape).clickable { web?.reload() }.padding(7.dp))
+            // Add to Home screen: installs the site as a BlazeOS app with its real icon.
+            Icon(Icons.Rounded.AddToHomeScreen, "Add to Home screen", tint = look.accent, modifier = Modifier.size(34.dp).clip(CircleShape).clickable {
+                val u = web?.url.orEmpty()
+                if (installing) return@clickable
+                installing = true
+                scope.launch {
+                    val (ins, why) = com.blaze.assistant.siteapps.SiteInstaller.inspect(u)
+                    val err = if (ins == null) why else com.blaze.assistant.siteapps.SiteInstaller.installInBlazeOs(ins)
+                    installing = false
+                    if (err != null) BlazeOs.notify("Browser", "Couldn't add it", err)
+                }
+            }.padding(7.dp))
         }
         Spacer(Modifier.height(2.dp))
     }

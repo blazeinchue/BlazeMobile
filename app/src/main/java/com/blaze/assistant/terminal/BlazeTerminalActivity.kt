@@ -277,7 +277,7 @@ class BlazeTerminalActivity : ComponentActivity(), TermSessions.Listener {
         val cpu = TermLogic.cpu(android.os.Build.SUPPORTED_ABIS.firstOrNull()) ?: "aarch64"
         val list = Distros.installable()
         val labels = list.map { d ->
-            val size = d.sizeMb[cpu]?.let { "~$it MB" } ?: ""
+            val size = TermLogic.sizeLine(d, cpu)
             "${d.env().label}  ·  " + if (Distros.installed(d.id)) "installed" else size
         }
         dialog().setTitle("Linux on this phone").setItems(labels.toTypedArray()) { _, i ->

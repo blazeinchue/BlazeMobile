@@ -22,7 +22,9 @@ object TermLogic {
 
     /** A Linux the user can install. [urls] maps CPU ("aarch64"/"arm") to a proot-distro rootfs tarball (.tar.xz). */
     data class Distro(val id: String, val name: String, val version: String, val sizeMb: Map<String, Int>,
-                      val urls: Map<String, String>, val hint: List<String>) {
+                      val urls: Map<String, String>, val hint: List<String>,
+                      /** v0.34.0: SHA-256 of each rootfs tarball (checked after download) and its exact size in bytes. */
+                      val sha256: Map<String, String> = emptyMap(), val bytes: Map<String, Long> = emptyMap()) {
         fun env() = Env(id, "$name $version".trim(), id, hint)
     }
 
@@ -45,6 +47,33 @@ object TermLogic {
         Distro("manjaro", "Manjaro", "ARM", mapOf("aarch64" to 141), mapOf("aarch64" to "$PD/v4.18.0/manjaro-aarch64-pd-v4.18.0.tar.xz"),
             listOf("Search:  pacman -Ss <query>", "Install: pacman -S <package>", "Upgrade: pacman -Syu")),
     )
+
+    /**
+     * v0.34.0: checksums and real sizes for every rootfs Blaze downloads. Computed on 2026-10-18 by streaming each
+     * release asset through sha256sum; they match termux/proot-distro's own distro-plugins (TARBALL_SHA256) and the
+     * GitHub release asset sizes.
+     */
+    val CHECKSUMS: Map<String, Pair<String, Long>> = mapOf(
+        "ubuntu-noble-aarch64-pd-v4.18.0.tar.xz" to ("91acaa786b8e2fbba56a9fd0f8a1188cee482b5c7baeed707b29ddaa9a294daa" to 64_133_552L),
+        "ubuntu-noble-arm-pd-v4.18.0.tar.xz" to ("2afb7e1ff17983fa2cf4c57edeea6be427ffb0359d8628b24a147b4c8aa276d5" to 63_043_912L),
+        "debian-bookworm-aarch64-pd-v4.17.3.tar.xz" to ("3a841a794ae5999b33e33b329582ed0379d4f54ca62c6ce5a8eb9cff5ef8900b" to 42_912_980L),
+        "debian-bookworm-arm-pd-v4.17.3.tar.xz" to ("85861ab139d4042302796cf46a93a9efbcb4808c06f7a1ae5fb71812f4564424" to 41_469_448L),
+        "archlinux-aarch64-pd-v4.22.1.tar.xz" to ("b7e4cfb1414a281f90bfd39a503f72f38e03c31b356927972f797988fb48b5b1" to 149_200_240L),
+        "archlinux-arm-pd-v4.22.1.tar.xz" to ("25ccafc3234bc9e0cd37ea240a4b6ec349464e88cf22e9db0d11a9f1a927d336" to 140_201_652L),
+        "fedora-aarch64-pd-v4.24.0.tar.xz" to ("48abf1d8b9cc7625d4212cc604ce3c113ea6d6d806de60b2c3f74c5b5452cd72" to 33_614_832L),
+        "manjaro-aarch64-pd-v4.18.0.tar.xz" to ("f0aa5f70a4ccfe00f658bf9adc4a18d8332e894591839adb990d913c9aa604b9" to 140_306_612L),
+    )
+
+    /** The SHA-256 for this distro's tarball on [cpu] ("" = not known: then it isn't checked). */
+    fun sha256(d: Distro, cpu: String): String = d.urls[cpu]?.substringAfterLast('/')?.let { CHECKSUMS[it]?.first }.orEmpty()
+    /** Exact download size in bytes (0 = unknown). */
+    fun bytes(d: Distro, cpu: String): Long = d.urls[cpu]?.substringAfterLast('/')?.let { CHECKSUMS[it]?.second } ?: 0L
+    /** "64.1 MB download, SHA-256 checked" / Alpine's own line. */
+    fun sizeLine(d: Distro, cpu: String?): String {
+        if (cpu == null) return ""
+        val b = bytes(d, cpu)
+        return if (b > 0) "%.1f MB download \u00b7 SHA-256 checked".format(b / 1e6) else d.sizeMb[cpu]?.let { "~$it MB" }.orEmpty()
+    }
 
     fun distro(id: String): Distro? = DISTROS.firstOrNull { it.id == id }
 

@@ -92,6 +92,7 @@ import com.blaze.assistant.mediaapps.store.StoreItem
 import com.blaze.assistant.mediaapps.store.StoreSource
 import com.blaze.assistant.mediaapps.store.StoreSources
 import com.blaze.assistant.ui.BlazeBrush
+import com.blaze.assistant.ui.BlazeDialog
 import com.blaze.assistant.ui.BlazeShapes
 import com.blaze.assistant.ui.BlazeTextField
 import com.blaze.assistant.ui.DialogColors
@@ -596,11 +597,30 @@ fun PreviewSheet(kind: String, item: StoreItem, source: StoreSource, onDismiss: 
                         }
                     }
                 }
+                // v0.34.0: what it costs in data, before it plays or downloads.
+                val metered = remember(item.id) { MediaPrefs.metered(ctx) }
+                val saving = remember(item.id) { MediaPrefs.saving(ctx) }
+                val picked = choices.firstOrNull { it.id == pick }
+                val streamChoice = if (saving) VideoSmart.saverChoice(kind, choices) else source.defaultChoice(kind, choices)
+                val streamBytes = streamChoice?.bytes ?: 0L
+                var confirmWatch by remember(item.id) { mutableStateOf(false) }
+                if (d != null && choices.isNotEmpty()) {
+                    val dl = VideoSmart.costLine(picked?.bytes ?: 0L, metered, kind).replace(if (kind == "video") "to watch" else "to listen", "to download")
+                    val st = VideoSmart.costLine(streamBytes, metered, kind)
+                    if (dl.isNotBlank() || st.isNotBlank()) {
+                        Spacer(Modifier.height(10.dp))
+                        if (st.isNotBlank()) MText((if (kind == "video") "Watch: " else "Play: ") + st + if (saving) " · data saver (${streamChoice?.label.orEmpty().take(24)})" else "",
+                            12.sp, if (metered) BlazeBrush.orange else DialogColors.body, maxLines = 2)
+                        if (dl.isNotBlank()) MText("Download: " + dl.substringBefore(" · "), 12.sp, DialogColors.body)
+                    }
+                }
+                if (confirmWatch && d != null) BlazeDialog("Watch on mobile data?", "This stream uses about ${TimeText.size(streamBytes)} of your data. Downloaded videos play offline for free.",
+                    confirm = "Watch", onConfirm = { confirmWatch = false; onPlay(d) }, dismiss = "Not now", onDismiss = { confirmWatch = false })
                 Spacer(Modifier.height(16.dp))
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End), verticalAlignment = Alignment.CenterVertically) {
                     PillButton("Close", primary = false, onClick = onDismiss)
                     if (d != null && choices.isNotEmpty()) {
-                        PillButton(if (kind == "video") "Watch" else "Play", primary = false) { onPlay(d) }
+                        PillButton(if (kind == "video") "Watch" else "Play", primary = false) { if (VideoSmart.warnFirst(streamBytes, metered)) confirmWatch = true else onPlay(d) }
                         PillButton("Download", primary = true) { choices.firstOrNull { it.id == pick }?.let { onDownload(d, it) } }
                     }
                 }

@@ -5,6 +5,25 @@ Newest first. Builds before v0.8.0 were numbered 1.0–1.17.0; `versionCode` has
 
 
 
+## v0.34.0: subtitles that work, smarter Video / Music / Gallery, Camera Night + HDR, a fuller Linux desktop (versionCode 135)
+
+- **Subtitles reach the player** (mediaapps/Subs.kt, SubsLoader.kt): Blaze Video now reads YouTube's caption tracks (manual and auto-generated), converts json3 / srv1 / WebVTT / SubRip into one clean WebVTT track and side-loads it into Media3, so the subtitle menu has real choices. A live subtitle menu while playing, and `.srt` / `.vtt` files next to a video are picked up.
+- **Video**: data cost before streaming, series / episodes with skip intro and autoplay next, smart downloads, AI subtitle translation, "previously on" recap; agent tool `video_ops`.
+- **Music**: smart playlists, daily mixes, Wrapped, data saver, equaliser, fades and sleep fade, playlist import, Blaze DJ, tag fixer, karaoke (lyrics), Android Auto; agent tool `music_ops`.
+- **Gallery**: Clean up (duplicates, blurry shots), Trash, paging for big libraries, On this day, a photo editor, pinch-to-resize grid, a backup plan, location-free sharing; agent tool `gallery_ops`.
+- **Camera**: Night (4-frame aligned burst) and HDR (about -2 / 0 / +2 EV, fused) in Photo mode at up to 1600 px (1280 on low-RAM phones); Document mode lets you drag 4 corners onto the page and flattens it (no Google scanner needed); Text mode works out prices (with totals per currency) and sums it read; product barcodes (EAN / UPC) are looked up on Open Food Facts; agent tool `camera_math` (exposure, hand-held shutter, depth of field / hyperfocal, ND, reading receipts).
+- **Linux desktop**:
+  - **App drawer**: every app the desktop's .desktop files list, one tap opens it.
+  - **App store**: a curated list (Firefox, LibreOffice, VS Code via code-server, GIMP, Inkscape, VLC, Geany, Thonny, htop, Git) with the real package names for Alpine / Debian / Ubuntu / Arch / Fedora, installed with that Linux's own package manager with live progress; apps a Linux can't run say why (e.g. Ubuntu's Firefox is a snap).
+  - **Two-way clipboard** in the viewer: what you copy in the desktop lands on the phone's clipboard; the new clipboard button sends the phone's clipboard to the desktop (paste with Ctrl+V).
+  - **Snapshots**: save the Linux as it is now (one .tar.gz in Blaze's own phone folder, space checked first) and restore it later; a restore unpacks next to the current Linux and swaps it in, so a failed restore changes nothing.
+  - **Restart by itself** (on by default): if Android or a crash closes the desktop, Blaze starts it again, at most 3 times in 10 minutes.
+  - **Screen size**: 1024x576 (default, lightest), 1280x720, 1600x900, 1920x1080, 1280x720 24-bit or portrait 720x1280, used from the next start; the agent's clicks are scaled to the real screen.
+  - **Careful-command check**: the `desktop` tool asks a second time, saying plainly that it could delete files or break the Linux, before typing or running anything like `rm -rf /`, `mkfs`, `dd of=`, package removal, `curl | sh` or a force push.
+  - The `desktop` tool gains apps, launch, store, install, snapshot and snapshots.
+  - Every other-Linux download (Ubuntu, Debian, Arch, Fedora, Manjaro) is SHA-256 checked, and the Terminal shows exact sizes.
+- Tests: SubsTest, VideoSmartTest, MusicSmartTest, GalleryToolsTest, CameraSmartTest, DesktopExtrasTest.
+
 ## v0.33.5: Stop the desktop download, pick your Linux (versionCode 134)
 
 - **Stop download, keeping progress**: the Desktop page's greyed-out "Working…" is now **Stop download**, and the download notification has a **Stop** action. Stop closes the download in flight (the `.part` file stays), kills the running install process (PRoot `--kill-on-exit` takes apk / apt / pacman / dnf with it) and wakes any retry wait, for the Alpine and other-Linux base downloads, the desktop packages Blaze prefetches, and the package installs. The page shows a **Download paused** card ("41.2 MB of Ubuntu is kept on the phone") with **Start** (carries on: HTTP Range resume, the package manager skips what's installed, `dpkg --configure -a` finishes a half-done apt run, a stale pacman lock is cleared) and **Remove downloaded files** (partial archives, the package caches, and a Linux whose base never finished; an installed Alpine always stays). A "Download paused" notification with **Resume** is posted too, and the paused state survives a restart.

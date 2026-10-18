@@ -48,6 +48,8 @@ object MediaLib {
             _recent.value = readStrings(f(c, "recent.json"))
             _recentVideos.value = readStrings(f(c, "recent-videos.json"))
             _liked.value = readStrings(f(c, "liked.json"))
+            _plays.value = runCatching { MusicSmart.eventsParse(f(c, "plays.json").readText()) }.getOrDefault(emptyList())
+            pendingImports.putAll(runCatching { val o = JSONObject(f(c, "imports.json").readText()); o.keys().asSequence().associateWith { o.optString(it) } }.getOrDefault(emptyMap()))
             runCatching { val o = JSONObject(f(c, "positions.json").readText()); o.keys().forEach { positions[it] = o.optLong(it) } }
         }
         refresh()
@@ -86,7 +88,38 @@ object MediaLib {
     fun addDownload(t: Track) {
         synchronized(lock) { downloads = listOf(t) + downloads.filter { it.key != t.key } }
         saveTracks(); refresh()
+        // v0.34.0 playlist import: a song that was queued by an import lands in its playlist.
+        val vid = t.videoId.removePrefix("yt:")
+        pendingImports.remove(vid)?.let { plId ->
+            setPlaylists(_playlists.value.map { if (it.id == plId && t.key !in it.keys) it.copy(keys = it.keys + t.key, updated = System.currentTimeMillis()) else it })
+            savePending()
+        }
     }
+
+    // ---- v0.34.0 play log (smart playlists, daily mixes, Wrapped, Blaze DJ) ----
+    private val _plays = MutableStateFlow<List<PlayEvent>>(emptyList())
+    val plays: StateFlow<List<PlayEvent>> = _plays
+    fun logPlay(key: String, at: Long, ms: Long) {
+        val c = app ?: return
+        if (ms < 3_000 || key.startsWith("stream:")) return
+        val l = (_plays.value + PlayEvent(key, at, ms)).let { if (it.size > 6000) it.drop(it.size - 6000) else it }
+        _plays.value = l
+        write(f(c, "plays.json"), MusicSmart.eventsJson(l))
+    }
+
+    // ---- v0.34.0 tag fixer ----
+    fun updateTags(key: String, title: String, artist: String): Boolean {
+        val c = app ?: return false
+        var hit = false
+        synchronized(lock) { downloads = downloads.map { if (it.key == key) { hit = true; it.copy(title = title, artist = artist) } else it } }
+        if (hit) { saveTracks(); refresh() }
+        return hit
+    }
+
+    // ---- v0.34.0 pending playlist imports: video id → playlist id ----
+    private val pendingImports = HashMap<String, String>()
+    fun expectImport(videoId: String, playlistId: String) { pendingImports[videoId.removePrefix("yt:")] = playlistId; savePending() }
+    private fun savePending() { val c = app ?: return; write(f(c, "imports.json"), JSONObject(pendingImports as Map<*, *>).toString()) }
 
     /** Removes a downloaded file from the phone (gallery files are the Gallery's to delete). */
     fun deleteDownload(ctx: Context, key: String): Boolean {

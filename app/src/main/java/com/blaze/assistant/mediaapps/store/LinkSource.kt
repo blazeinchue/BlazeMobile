@@ -75,6 +75,16 @@ object LinkSource : StoreSource {
             " Try again in a bit.")
     }
 
+    /** v0.34.0: just the caption tracks of a YouTube video (for downloaded videos played from the library). */
+    suspend fun ytCaptions(vid: String): List<StoreSubtitle> {
+        val visitor = try { LinkYt.visitorId() } catch (_: Exception) { "" }
+        for (cl in LinkYt.clients) {
+            val tracks = try { com.blaze.assistant.mediaapps.Subs.ytTracks(LinkYt.player(cl, vid, visitor)) } catch (_: Exception) { emptyList() }
+            if (tracks.isNotEmpty()) return tracks
+        }
+        return emptyList()
+    }
+
     private suspend fun direct(url: String): StoreDetail = withContext(Dispatchers.IO) {
         val head = LinkYt.peek(url)
         var target = url; var mime = head.mime; var len = head.length
@@ -212,8 +222,9 @@ object LinkParse {
         if (out.isEmpty()) throw StoreError("YouTube only offered protected streams for this video")
         val thumbs = vd.optJSONObject("thumbnail")?.optJSONArray("thumbnails") ?: JSONArray()
         val thumb = if (thumbs.length() > 0) thumbs.optJSONObject(thumbs.length() - 1)?.optString("url").orEmpty() else "https://i.ytimg.com/vi/$vid/hqdefault.jpg"
+        // v0.34.0: the caption tracks go with the streams, so Blaze Video can side-load them as subtitles.
         return StoreDetail("yt:$vid", vd.optString("title").ifBlank { "YouTube video" }, vd.optString("author"), vd.optString("lengthSeconds").toIntOrNull() ?: 0,
-            thumb, out, "YouTube")
+            thumb, out, "YouTube", subtitles = com.blaze.assistant.mediaapps.Subs.ytTracks(root))
     }
 
     /** Music: AAC (m4a) qualities then Opus, best first. Video: H.264 heights ≤ 1080p (video + best AAC, merged) and progressive files, best first. */
@@ -281,6 +292,13 @@ object LinkYt {
         val body = JSONObject().put("context", ctx(web))
         if (continuation.isNotBlank()) body.put("continuation", continuation) else body.put("query", query).put("params", "EgIQAQ==")
         post("https://www.youtube.com/youtubei/v1/search?prettyPrint=false", body.toString(), web, "")
+    }
+
+    /** v0.34.0 playlist import: one page of a playlist (WEB browse "VL<id>", or a continuation), raw InnerTube JSON. */
+    suspend fun playlist(listId: String, continuation: String = ""): String = withContext(Dispatchers.IO) {
+        val body = JSONObject().put("context", ctx(web))
+        if (continuation.isNotBlank()) body.put("continuation", continuation) else body.put("browseId", "VL$listId")
+        post("https://www.youtube.com/youtubei/v1/browse?prettyPrint=false", body.toString(), web, "")
     }
 
     /** Title and channel of a video (public oEmbed, no client needed). */

@@ -31,6 +31,9 @@ import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
@@ -98,6 +101,11 @@ import androidx.media3.ui.PlayerView
 import com.blaze.assistant.mediaapps.store.StoreDetail
 import com.blaze.assistant.mediaapps.store.StoreItem
 import com.blaze.assistant.mediaapps.store.StoreSource
+import com.blaze.assistant.mediaapps.store.StoreSubtitle
+import com.blaze.assistant.mediaapps.store.LinkSource
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.media3.exoplayer.source.MediaSource
+import android.widget.Toast
 import com.blaze.assistant.ui.BackButton
 import com.blaze.assistant.ui.BlazeBrush
 import com.blaze.assistant.ui.BlazeDialog
@@ -124,6 +132,146 @@ class VideoActivity : ComponentActivity() {
     companion object {
         fun open(ctx: Context, tab: String = "") = ctx.startActivity(Intent(ctx, VideoActivity::class.java)
             .putExtra(MusicActivity.EXTRA_TAB, tab).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT))
+        const val EXTRA_PLAY = "blaze_video_play"
+        /** v0.34.0: plays a library video (agent tool video_ops play). */
+        fun openAndPlay(ctx: Context, key: String) = ctx.startActivity(Intent(ctx, VideoActivity::class.java)
+            .putExtra(EXTRA_PLAY, key).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT))
+        /** The open Video app (same process), for the agent's video_ops tool. */
+        @Volatile var live: VideoActivity? = null
+            private set
+    }
+
+    // ---------------------------------------------------------------- v0.34.0 smart video
+    /** The next episode waiting on the "Up next" countdown (null = none). */
+    val upNext = mutableStateOf<Track?>(null)
+    var upNextAt = 0L
+    /** Recap / translation progress and results for the player screen. */
+    val recapText = mutableStateOf<String?>(null)
+    val work = mutableStateOf("")
+    private var intros: MutableMap<String, Long> = HashMap()
+
+    fun seriesKey(t: Track?): String? = t?.let { VideoSmart.episode(it.title)?.key }
+    fun introEnd(t: Track?): Long = seriesKey(t)?.let { intros[it] } ?: 0L
+
+    fun markIntroEnd() {
+        val k = seriesKey(current.value) ?: return
+        val at = player.currentPosition
+        intros[k] = at; MediaPrefs.setIntro(this, k, at)
+        Toast.makeText(this, "Skip intro will jump to ${TimeText.clock(at)} in every episode.", Toast.LENGTH_SHORT).show()
+    }
+
+    fun skipIntro() { val e = introEnd(current.value); if (e > 0) player.seekTo(e) }
+
+    private fun onEnded() {
+        val t = current.value ?: return
+        if (t.source != "stream") MediaPrefs.markFinished(this, t.key, System.currentTimeMillis())
+        if (!MediaPrefs.autoplay(this) || t.source == "stream") return
+        val next = VideoSmart.next(t, MediaLib.videos.value) ?: return
+        upNextAt = System.currentTimeMillis(); upNext.value = next
+    }
+
+    fun cancelUpNext() { upNext.value = null }
+
+    /** The subtitle track that's on now (or the first loaded one) with its cues. */
+    private fun activeCues(): Pair<StoreSubtitle, List<Cue>>? {
+        val on = player.currentTracks.groups.firstOrNull { it.type == C.TRACK_TYPE_TEXT && it.isSelected }?.let { g ->
+            (0 until g.length).firstOrNull { g.isTrackSelected(it) }?.let { g.getTrackFormat(it) } }
+        val t = subsLoaded.firstOrNull { s -> on != null && (on.id == s.id || on.id?.endsWith(":" + s.id) == true || on.label == Subs.label(s)) }
+            ?: subsLoaded.firstOrNull() ?: return null
+        val cues = SubsLoader.cues(t)
+        return if (cues.isEmpty()) null else t to cues
+    }
+
+    /** A first subtitle track to work from when none is loaded: the viewer's language, else English, else any. */
+    private suspend fun ensureSomeSubs(): Pair<StoreSubtitle, List<Cue>>? {
+        activeCues()?.let { return it }
+        val t = current.value ?: return null
+        val cand = Subs.ordered(subsAvailable.value, java.util.Locale.getDefault().language).firstOrNull() ?: return null
+        val local = if (cand.url.startsWith("file:")) cand else {
+            val cues = SubsLoader.fetchYouTube(cand); if (cues.isEmpty()) return null
+            withContext(Dispatchers.IO) { SubsLoader.save(this@VideoActivity, t.key, cand, cues) }
+        }
+        val cues = SubsLoader.cues(local)
+        return if (cues.isEmpty()) null else local to cues
+    }
+
+    /** "Recap so far": what was said up to here, summed up by Blaze's model. Null result = it couldn't. */
+    suspend fun recap(): String {
+        val t = current.value ?: return "Nothing is playing."
+        work.value = "Writing a recap…"
+        try {
+            val (_, cues) = ensureSomeSubs() ?: return "This video has no subtitles, so there's nothing to recap from. Load a .srt or .vtt file first."
+            val text = VideoSmart.transcript(cues, player.currentPosition)
+            if (text.isBlank()) return "Nothing has been said yet at this point."
+            val msgs = org.json.JSONArray().put(org.json.JSONObject().put("role", "user").put("content", VideoSmart.recapPrompt(t.title, text)))
+            val out = com.blaze.assistant.agent.LlmClient.complete(msgs, null, null, null, com.blaze.assistant.agent.LlmClient.Lane.BACKGROUND)
+                .optString("content").substringAfterLast("</think>").trim()
+            return out.ifBlank { "Blaze couldn't write a recap right now. Try again in a moment." }
+        } catch (e: Exception) {
+            return "Blaze couldn't write a recap: " + (e.message ?: "no connection")
+        } finally { work.value = "" }
+    }
+
+    /**
+     * AI subtitle translation: the subtitles that are on (or the first available) translated into [language] by Blaze's
+     * model in batches, kept with the video as a new track "<language> (AI translation)" and turned on.
+     */
+    suspend fun translate(language: String): String {
+        val t = current.value ?: return "Nothing is playing."
+        val lang = language.trim().ifBlank { java.util.Locale.getDefault().getDisplayLanguage(java.util.Locale.ENGLISH) }
+        val (src, cues) = ensureSomeSubs() ?: return "This video has no subtitles to translate. Load a .srt or .vtt file first."
+        val batches = VideoSmart.batches(cues)
+        val out = ArrayList<Cue>()
+        try {
+            batches.forEachIndexed { i, b ->
+                work.value = "Translating subtitles to $lang · ${i + 1} of ${batches.size}"
+                val msgs = org.json.JSONArray().put(org.json.JSONObject().put("role", "user").put("content", VideoSmart.translatePrompt(b, lang)))
+                val reply = try {
+                    com.blaze.assistant.agent.LlmClient.complete(msgs, null, null, null, com.blaze.assistant.agent.LlmClient.Lane.BACKGROUND)
+                        .optString("content").substringAfterLast("</think>")
+                } catch (_: Exception) { "" }
+                out += VideoSmart.applyTranslation(b, reply)
+            }
+        } finally { work.value = "" }
+        if (VideoSmart.translatedShare(cues, out) < 0.3) return "The translation didn't come back. Check the connection and try again."
+        val code = langCode(lang)
+        val track = StoreSubtitle("ai-" + lang.lowercase().replace(Regex("[^a-z]"), "") + "-" + src.id.take(24), "", code, "$lang (AI translation)", auto = true)
+        val local = withContext(Dispatchers.IO) { SubsLoader.save(this@VideoActivity, t.key, track, out) }
+        if (current.value?.key == t.key) attach(local)
+        return "Subtitles translated to $lang and turned on (${out.size} lines)."
+    }
+
+    private fun langCode(name: String): String {
+        val n = name.trim().lowercase()
+        if (n.length in 2..3 && n.all { it.isLetter() }) return n
+        return java.util.Locale.getAvailableLocales().firstOrNull { it.getDisplayLanguage(java.util.Locale.ENGLISH).equals(name.trim(), true) }?.language.orEmpty()
+    }
+
+    /** Agent: turn subtitles on in [language] ("off" turns them off). */
+    fun subtitlesTo(language: String): String {
+        if (language.equals("off", true)) { subtitlesOff(); return "Subtitles off." }
+        val want = language.trim()
+        val match = { s: StoreSubtitle -> Subs.sameLang(s.lang, want) || Subs.label(s).contains(want, true) }
+        val tr = subsAvailable.value.filter(match).sortedBy { it.auto }.firstOrNull() ?: return "No $want subtitles for this video. I can translate the ones it has (video_ops translate_subtitles)."
+        chooseSubtitle(Subs.MenuItem(tr.id, Subs.label(tr), tr.lang, subsLoaded.any { it.id == tr.id }, false))
+        return "Turning on ${Subs.label(tr)} subtitles."
+    }
+
+    /** Smart downloads: watched episodes are cleared a day after they finished. */
+    private fun smartCleanup() {
+        if (!MediaPrefs.smartDownloads(this)) return
+        val gone = VideoSmart.toClear(MediaLib.videos.value, MediaPrefs.finished(this), System.currentTimeMillis())
+        gone.forEach { MediaLib.deleteDownload(this, it.key) }
+        if (gone.isNotEmpty()) lifecycleScope.launch { Toast.makeText(this@VideoActivity, "Smart downloads cleared ${gone.size} watched episode" + (if (gone.size == 1) "" else "s") + ".", Toast.LENGTH_SHORT).show() }
+    }
+
+    private fun handlePlay(i: Intent?) {
+        val key = i?.getStringExtra(EXTRA_PLAY)?.takeIf { it.isNotBlank() } ?: return
+        i.removeExtra(EXTRA_PLAY)
+        lifecycleScope.launch {
+            withContext(Dispatchers.IO) { MediaLib.ensure(this@VideoActivity) }
+            MediaLib.find(key)?.let { play(it) }
+        }
     }
 
     lateinit var player: ExoPlayer
@@ -134,12 +282,31 @@ class VideoActivity : ComponentActivity() {
     /** The video loaded now (library track, or a Store stream). */
     val current = mutableStateOf<Track?>(null)
 
+    // ---------------------------------------------------------------- v0.34.0 subtitles
+    /** The player's tracks, updated live in onTracksChanged (the menu used to read them once and never again). */
+    val tracks = mutableStateOf(Tracks.EMPTY)
+    /** Subtitle tracks this video offers that the player may not have yet (YouTube captions, saved files). */
+    val subsAvailable = mutableStateOf<List<StoreSubtitle>>(emptyList())
+    /** Id of the track being fetched for the menu ("" = none). */
+    val subsBusy = mutableStateOf("")
+    val subsError = mutableStateOf("")
+    /** Tracks side-loaded into the player now (local .vtt files). */
+    private val subsLoaded = ArrayList<StoreSubtitle>()
+    /** What [current] plays from, so it can be rebuilt with more subtitle tracks at the same spot. */
+    private var playUris: List<String> = emptyList()
+    /** A subtitle id to select as soon as the player reports it. */
+    private var pendingSub: String? = null
+    private val pickSubFile = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> if (uri != null) loadSubtitleFile(uri) }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         intent?.getStringExtra(MusicActivity.EXTRA_TAB)?.takeIf { it.isNotBlank() }?.let { tab.value = it }
         com.blaze.assistant.mediaapps.store.JamendoSource.init(this)
-        lifecycleScope.launch(Dispatchers.IO) { MediaLib.ensure(this@VideoActivity); Downloads.resumePending(this@VideoActivity) }
+        lifecycleScope.launch(Dispatchers.IO) { MediaLib.ensure(this@VideoActivity); Downloads.resumePending(this@VideoActivity); smartCleanup() }
+        intros = MediaPrefs.intros(this).toMutableMap()
+        live = this
+        handlePlay(intent)
         player = ExoPlayer.Builder(this)
             .setMediaSourceFactory(DefaultMediaSourceFactory(DefaultDataSource.Factory(this, http)))
             .setAudioAttributes(AudioAttributes.Builder().setUsage(C.USAGE_MEDIA).setContentType(C.AUDIO_CONTENT_TYPE_MOVIE).build(), true)
@@ -151,8 +318,22 @@ class VideoActivity : ComponentActivity() {
                 if (isPlaying) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) else { window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON); savePos() }
                 if (Build.VERSION.SDK_INT >= 26) runCatching { setPictureInPictureParams(pipParams()) }
             }
-            override fun onPlaybackStateChanged(state: Int) { if (state == Player.STATE_ENDED) current.value?.let { MediaLib.savePosition(it.key, 0, 1) } }
+            override fun onPlaybackStateChanged(state: Int) {
+                if (state == Player.STATE_ENDED) { current.value?.let { MediaLib.savePosition(it.key, 0, 1) }; onEnded() }
+            }
+            override fun onPositionDiscontinuity(old: Player.PositionInfo, new: Player.PositionInfo, reason: Int) {
+                // v0.34.0 skip intro: an early jump forward in an episode teaches where the series' intro ends.
+                if (reason != Player.DISCONTINUITY_REASON_SEEK || old.mediaItemIndex != new.mediaItemIndex) return
+                val k = seriesKey(current.value) ?: return
+                val known = intros[k] ?: 0L
+                val learned = VideoSmart.learnIntro(known, old.positionMs, new.positionMs)
+                if (learned != known) { intros[k] = learned; MediaPrefs.setIntro(this@VideoActivity, k, learned) }
+            }
             override fun onPlayerError(error: PlaybackException) { retryStream(error) }
+            override fun onTracksChanged(t: Tracks) {
+                tracks.value = t
+                pendingSub?.let { id -> if (selectSubtitle(id)) pendingSub = null }
+            }
         })
         StoragePermission.asker = null
         setContent { BlazeTheme { VideoApp(this) } }
@@ -161,6 +342,7 @@ class VideoActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         intent.getStringExtra(MusicActivity.EXTRA_TAB)?.takeIf { it.isNotBlank() }?.let { tab.value = it }
+        handlePlay(intent)
     }
 
     fun savePos() {
@@ -172,12 +354,124 @@ class VideoActivity : ComponentActivity() {
     /** Plays a library video from where it was left. */
     fun play(t: Track) {
         savePos()
+        upNext.value = null
         current.value = t
         MediaLib.played(t)
-        player.setMediaItem(MediaItem.Builder().setMediaId(t.key).setUri(t.uri)
-            .setMediaMetadata(MediaMetadata.Builder().setTitle(t.title).build()).build(), ResumeLogic.resumeAt(MediaLib.position(t.key), t.durationMs))
-        player.prepare(); player.play()
+        playUris = listOf(t.uri)
+        resetSubs(SubsLoader.saved(this, t.key))
+        val at = ResumeLogic.resumeAt(MediaLib.position(t.key), t.durationMs)
+        // Saved subtitles (a file loaded before, captions kept with a download) come back by themselves; a downloaded
+        // YouTube video also gets its YouTube caption list when online.
+        Subs.pick(subsAvailable.value, SubsLoader.pref(this))?.let { subsLoaded += it; pendingSub = it.id }
+        subsLoaded.addAll(subsAvailable.value.filter { s -> subsLoaded.none { it.id == s.id } })
+        load(at, true)
         tab.value = "player"
+        val vid = t.videoId.removePrefix("yt:")
+        if ((t.storeSource == "youtube" || t.videoId.startsWith("yt:")) && Regex("^[A-Za-z0-9_-]{11}$").matches(vid)) lifecycleScope.launch {
+            val yt = try { LinkSource.ytCaptions(vid) } catch (_: Exception) { emptyList() }
+            if (current.value?.key == t.key) mergeAvailable(yt)
+        }
+    }
+
+    private fun resetSubs(saved: List<StoreSubtitle>) {
+        subsLoaded.clear(); pendingSub = null; subsBusy.value = ""; subsError.value = ""
+        subsAvailable.value = saved
+    }
+
+    private fun mergeAvailable(more: List<StoreSubtitle>) {
+        val have = subsAvailable.value
+        subsAvailable.value = have + more.filter { m -> have.none { it.id == m.id } }
+    }
+
+    /** (Re)loads [current] from [playUris] with every side-loaded subtitle in [subsLoaded], at [at]. */
+    private fun load(at: Long, play: Boolean) {
+        val t = current.value ?: return
+        val subs = subsLoaded.map { SubsLoader.config(it, it.id == pendingSub) }
+        val first = MediaItem.Builder().setMediaId(t.key).setUri(playUris.first())
+            .setMediaMetadata(MediaMetadata.Builder().setTitle(t.title).build()).setSubtitleConfigurations(subs).build()
+        if (playUris.size == 1) player.setMediaItem(first, at)
+        else {
+            val msf = DefaultMediaSourceFactory(DefaultDataSource.Factory(this, http))
+            val parts = ArrayList<MediaSource>()
+            parts += msf.createMediaSource(first)
+            playUris.drop(1).forEach { parts += ProgressiveMediaSource.Factory(DefaultDataSource.Factory(this, http)).createMediaSource(MediaItem.fromUri(it)) }
+            player.setMediaSource(MergingMediaSource(*parts.toTypedArray()), at)
+        }
+        if (pendingSub != null) player.trackSelectionParameters = player.trackSelectionParameters.buildUpon().setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false).build()
+        player.prepare(); player.playWhenReady = play
+    }
+
+    /** Turns on the player's text track with this id (side-loaded tracks keep their SubtitleConfiguration id). */
+    fun selectSubtitle(id: String): Boolean {
+        val label = (subsLoaded + subsAvailable.value).firstOrNull { it.id == id }?.let { Subs.label(it) }
+        for (g in player.currentTracks.groups) {
+            if (g.type != C.TRACK_TYPE_TEXT) continue
+            for (i in 0 until g.length) {
+                val f = g.getTrackFormat(i)
+                if (f.id == id || f.id?.endsWith(":$id") == true || (label != null && f.label == label)) {
+                    player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
+                        .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
+                        .setOverrideForType(TrackSelectionOverride(g.mediaTrackGroup, i)).build()
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    fun subtitlesOff() {
+        pendingSub = null
+        player.trackSelectionParameters = player.trackSelectionParameters.buildUpon().clearOverridesOfType(C.TRACK_TYPE_TEXT).setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true).build()
+        SubsLoader.setPref(this, "off")
+    }
+
+    /** The user picked a subtitle in the menu: select it, or fetch it first (YouTube) and add it to the player. */
+    fun chooseSubtitle(item: Subs.MenuItem) {
+        if (item.lang.isNotBlank()) SubsLoader.setPref(this, item.lang)
+        if (item.loaded || subsLoaded.any { it.id == item.id }) {
+            if (!selectSubtitle(item.id)) pendingSub = item.id
+            return
+        }
+        val t = current.value ?: return
+        val track = subsAvailable.value.firstOrNull { it.id == item.id } ?: return
+        subsBusy.value = track.id; subsError.value = ""
+        lifecycleScope.launch {
+            val local = if (track.url.startsWith("file:")) track else {
+                val cues = try { SubsLoader.fetchYouTube(track) } catch (_: Exception) { emptyList() }
+                if (cues.isEmpty()) null else withContext(Dispatchers.IO) { SubsLoader.save(this@VideoActivity, t.key, track, cues) }
+            }
+            subsBusy.value = ""
+            if (current.value?.key != t.key) return@launch
+            if (local == null) { subsError.value = "YouTube didn't send the ${Subs.label(track)} subtitles. Try again, or load a file."; return@launch }
+            attach(local)
+        }
+    }
+
+    /** Adds a saved track to the player (rebuilding the source at the same spot) and selects it. */
+    private fun attach(local: StoreSubtitle) {
+        subsLoaded.removeAll { it.id == local.id }; subsLoaded += local
+        subsAvailable.value = subsAvailable.value.map { if (it.id == local.id) local else it }.let { l -> if (l.any { it.id == local.id }) l else l + local }
+        pendingSub = local.id
+        load(player.currentPosition, player.playWhenReady)
+    }
+
+    fun openSubtitleFile() {
+        runCatching { pickSubFile.launch(arrayOf("application/x-subrip", "text/vtt", "text/plain", "application/octet-stream", "*/*")) }
+    }
+
+    /** A .srt / .vtt from the phone: parsed, kept with this video, added and turned on. */
+    fun loadSubtitleFile(uri: Uri) {
+        val t = current.value ?: return
+        lifecycleScope.launch {
+            try {
+                val (name, cues) = SubsLoader.readFile(this@VideoActivity, uri)
+                val id = "file-" + Subs.folderFor(uri.toString()).take(8)
+                val local = withContext(Dispatchers.IO) { SubsLoader.save(this@VideoActivity, t.key, StoreSubtitle(id, "", "", name.substringBeforeLast('.'), false), cues) }
+                if (current.value?.key == t.key) attach(local)
+            } catch (e: Exception) {
+                Toast.makeText(this@VideoActivity, e.message ?: "Couldn't read that subtitle file.", Toast.LENGTH_LONG).show()
+            }
+        }
     }
 
     private var lastWatch: Pair<StoreItem, StoreSource>? = null
@@ -199,8 +493,10 @@ class VideoActivity : ComponentActivity() {
 
     /** Watch a Store result without downloading: one progressive file, or video + audio merged while playing. */
     fun watch(item: StoreItem, d: StoreDetail, src: StoreSource, at: Long = 0) {
-        val picks = src.streamPick("video", d)
+        // v0.34.0 data saver: on mobile data the smallest picture (240p or more).
+        val picks = VideoSmart.streamFor("video", d, src, MediaPrefs.saving(this))
         if (picks.isEmpty()) return
+        upNext.value = null
         lastWatch = item to src
         if (at == 0L) retriedKey = ""
         savePos()
@@ -208,13 +504,27 @@ class VideoActivity : ComponentActivity() {
         Taste.note(this, "video", d.title.ifBlank { item.title }, d.author.ifBlank { item.author }, Taste.PLAY)
         val t = Track("stream:${item.source}:${item.id}", picks[0].url, d.title.ifBlank { item.title }, d.author.ifBlank { item.author }, "",
             d.lengthSec * 1000L, item.thumb, "stream", 0, item.id, "video", d.licence.ifBlank { item.licence }, item.source)
+        val same = current.value?.key == t.key
         current.value = t
-        val factory = ProgressiveMediaSource.Factory(DefaultDataSource.Factory(this, http))
-        if (picks.size == 1) player.setMediaItem(MediaItem.Builder().setMediaId(t.key).setUri(picks[0].url).build())
-        else player.setMediaSource(MergingMediaSource(*picks.map { factory.createMediaSource(MediaItem.fromUri(it.url)) }.toTypedArray()))
-        if (at > 0) player.seekTo(at)
-        player.prepare(); player.play()
+        playUris = picks.map { it.url }
+        val keep = if (same) subsLoaded.toList() else emptyList()
+        if (!same) resetSubs(SubsLoader.saved(this, t.key))
+        mergeAvailable(d.subtitles)
+        subsLoaded.clear(); subsLoaded.addAll(keep)
         tab.value = "player"
+        // The viewer's subtitle language (if they turned subtitles on before) is fetched first, ~4 s at most, so the
+        // video starts with it on; any other track loads when picked in the menu.
+        val want = if (keep.isEmpty()) Subs.pick(subsAvailable.value, SubsLoader.pref(this)) else null
+        if (want == null) { load(at, true); return }
+        lifecycleScope.launch {
+            val local = if (want.url.startsWith("file:")) want else kotlinx.coroutines.withTimeoutOrNull(4_000) {
+                val cues = SubsLoader.fetchYouTube(want)
+                if (cues.isEmpty()) null else withContext(Dispatchers.IO) { SubsLoader.save(this@VideoActivity, t.key, want, cues) }
+            }
+            if (current.value?.key != t.key) return@launch
+            if (local != null) { subsLoaded += local; subsAvailable.value = subsAvailable.value.map { if (it.id == local.id) local else it }; pendingSub = local.id }
+            load(at, true)
+        }
     }
 
     fun pipParams(): PictureInPictureParams {
@@ -264,6 +574,7 @@ class VideoActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        if (live === this) live = null
         savePos()
         player.release()
         super.onDestroy()
@@ -334,6 +645,14 @@ private fun PlayerSurface(a: VideoActivity, controls: Boolean) {
     var hint by remember { mutableStateOf("") }
     var speedMenu by remember { mutableStateOf(false) }
     var tracksOpen by remember { mutableStateOf(false) }
+    var moreMenu by remember { mutableStateOf(false) }
+    var autoplayOn by remember { mutableStateOf(MediaPrefs.autoplay(ctx)) }
+    var smartOn by remember { mutableStateOf(MediaPrefs.smartDownloads(ctx)) }
+    val scope = androidx.compose.runtime.rememberCoroutineScope()
+    val cur by a.current
+    val nextUp by a.upNext
+    val busyWork by a.work
+    val recap by a.recapText
     var speed by remember { mutableFloatStateOf(p.playbackParameters.speed) }
     DisposableEffect(p) {
         val l = object : Player.Listener {
@@ -423,6 +742,30 @@ private fun PlayerSurface(a: VideoActivity, controls: Boolean) {
             Spacer(Modifier.height(10.dp))
             PillButton("Try again", primary = true) { p.prepare(); p.play() }
         }
+        // v0.34.0: Skip intro (learned per series), Up next countdown, recap / translation progress.
+        val introAt = a.introEnd(cur)
+        if (controls && VideoSmart.showSkip(pos, introAt)) Box(Modifier.align(Alignment.BottomEnd).padding(end = 16.dp, bottom = 72.dp)) {
+            PillButton("Skip intro", primary = true) { a.skipIntro() }
+        }
+        nextUp?.let { nx ->
+            var left by remember(nx.key) { mutableStateOf(5) }
+            LaunchedEffect(nx.key) {
+                while (true) { left = VideoSmart.countdown(a.upNextAt, System.currentTimeMillis()); if (left < 0) break; delay(250) }
+                a.play(nx)
+            }
+            Column(Modifier.align(Alignment.BottomEnd).padding(16.dp).clip(BlazeShapes.medium).background(Color.Black.copy(alpha = 0.8f)).padding(14.dp)) {
+                MText("Up next in ${left.coerceAtLeast(0)}", 12.sp, Color.White.copy(alpha = 0.8f))
+                MText(nx.title, 14.sp, Color.White, FontWeight.SemiBold, maxLines = 2)
+                Spacer(Modifier.height(8.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    PillButton("Cancel", primary = false) { a.cancelUpNext() }
+                    PillButton("Play now", primary = true) { a.play(nx) }
+                }
+            }
+        }
+        if (busyWork.isNotBlank()) Box(Modifier.align(Alignment.TopStart).padding(10.dp).clip(BlazeShapes.small).background(Color.Black.copy(alpha = 0.7f)).padding(horizontal = 10.dp, vertical = 6.dp)) {
+            MText(busyWork, 12.sp, Color.White)
+        }
         if (controls) AnimatedVisibility(show && error.isBlank(), Modifier.fillMaxSize(), enter = MotionTokens.fade(), exit = MotionTokens.fadeAway()) {
             Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.35f))) {
                 Row(Modifier.align(Alignment.TopEnd).padding(6.dp)) {
@@ -432,6 +775,20 @@ private fun PlayerSurface(a: VideoActivity, controls: Boolean) {
                     }
                     RoundIcon(Icons.Rounded.ClosedCaption, "Subtitles and audio", tint = Color.White) { tracksOpen = true }
                     if (Build.VERSION.SDK_INT >= 26) RoundIcon(Icons.Rounded.PictureInPictureAlt, "Picture in picture", tint = Color.White) { a.enterPip() }
+                    Box {
+                        RoundIcon(Icons.Rounded.MoreVert, "More", tint = Color.White) { moreMenu = true }
+                        val lang = java.util.Locale.getDefault().getDisplayLanguage(java.util.Locale.ENGLISH)
+                        BlazeMenu(moreMenu, { moreMenu = false }, buildList<Pair<String, () -> Unit>> {
+                            add("Recap so far" to { scope.launch { a.recapText.value = a.recap() } })
+                            add("Translate subtitles to $lang (AI)" to { scope.launch { val r = a.translate(lang); android.widget.Toast.makeText(ctx, r, android.widget.Toast.LENGTH_LONG).show() } })
+                            if (a.seriesKey(a.current.value) != null) add("Mark the end of the intro here" to { a.markIntroEnd() })
+                            add((if (autoplayOn) "Autoplay next episode: on" else "Autoplay next episode: off") to {
+                                autoplayOn = !autoplayOn; MediaPrefs.setBool(ctx, MediaPrefs.AUTOPLAY, autoplayOn) })
+                            add((if (smartOn) "Smart downloads: on" else "Smart downloads: off") to {
+                                smartOn = !smartOn; MediaPrefs.setBool(ctx, MediaPrefs.SMART_DL, smartOn)
+                                android.widget.Toast.makeText(ctx, if (smartOn) "Watched episodes you downloaded are cleared a day after you finish them." else "Smart downloads off.", android.widget.Toast.LENGTH_SHORT).show() })
+                        })
+                    }
                 }
                 Row(Modifier.align(Alignment.Center), horizontalArrangement = Arrangement.spacedBy(28.dp), verticalAlignment = Alignment.CenterVertically) {
                     RoundIcon(Icons.Rounded.Replay10, "Back 10 seconds", size = 52, tint = Color.White) { p.seekBack() }
@@ -456,14 +813,23 @@ private fun PlayerSurface(a: VideoActivity, controls: Boolean) {
             }
         }
     }
-    if (tracksOpen) TracksDialog(p) { tracksOpen = false }
+    if (tracksOpen) TracksDialog(a) { tracksOpen = false }
+    recap?.let { r -> BlazeDialog("Recap so far", r, confirm = "Keep watching", onConfirm = { a.recapText.value = null }, onDismiss = { a.recapText.value = null }) }
 }
 
-/** Subtitles and audio tracks the video carries (embedded tracks). Off = no subtitles. */
+/**
+ * Subtitles and audio. v0.34.0: reads the player's tracks live ([VideoActivity.tracks], from onTracksChanged), lists
+ * YouTube's caption tracks and saved files that aren't loaded yet (picking one fetches it and adds it), and loads a
+ * .srt / .vtt from the phone. Off = no subtitles (remembered).
+ */
 @Composable
-private fun TracksDialog(p: ExoPlayer, onDismiss: () -> Unit) {
-    val groups = remember { p.currentTracks.groups }
-    val subs = groups.filter { it.type == C.TRACK_TYPE_TEXT && it.isSupported }
+private fun TracksDialog(a: VideoActivity, onDismiss: () -> Unit) {
+    val p = a.player
+    val tracks by a.tracks
+    val available by a.subsAvailable
+    val busy by a.subsBusy
+    val err by a.subsError
+    val groups = tracks.groups
     val audio = groups.filter { it.type == C.TRACK_TYPE_AUDIO && it.isSupported }
     val textOff = p.trackSelectionParameters.disabledTrackTypes.contains(C.TRACK_TYPE_TEXT)
     fun name(g: Tracks.Group, i: Int, n: Int): String {
@@ -471,25 +837,39 @@ private fun TracksDialog(p: ExoPlayer, onDismiss: () -> Unit) {
         return listOfNotNull(f.label, f.language?.let { java.util.Locale(it).displayLanguage.ifBlank { it } }).firstOrNull()
             ?: ((if (g.type == C.TRACK_TYPE_TEXT) "Subtitles " else "Audio ") + (n + 1))
     }
-    fun select(g: Tracks.Group, i: Int) {
-        p.trackSelectionParameters = p.trackSelectionParameters.buildUpon()
-            .setTrackTypeDisabled(g.type, false)
-            .setOverrideForType(TrackSelectionOverride(g.mediaTrackGroup, i)).build()
-        onDismiss()
-    }
-    BlazeDialog("Subtitles and audio", confirm = "Done", onConfirm = onDismiss, onDismiss = onDismiss) {
-        Column(Modifier.fillMaxWidth()) {
-            MText("Subtitles", 12.sp, DialogColors.body, FontWeight.Medium)
-            Option("Off", subs.isEmpty() || textOff) {
-                p.trackSelectionParameters = p.trackSelectionParameters.buildUpon().setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true).build(); onDismiss()
+    val inPlayer = ArrayList<Pair<Subs.MenuItem, () -> Unit>>()
+    var n = 0
+    groups.filter { it.type == C.TRACK_TYPE_TEXT && it.isSupported }.forEach { g ->
+        for (i in 0 until g.length) {
+            val k = n++
+            val f = g.getTrackFormat(i)
+            val id = available.firstOrNull { s -> f.id == s.id || f.id?.endsWith(":" + s.id) == true || f.label == Subs.label(s) }?.id ?: (f.id ?: "track-$k")
+            inPlayer += Subs.MenuItem(id, name(g, i, k), f.language.orEmpty(), true, !textOff && g.isTrackSelected(i)) to {
+                f.language?.let { l -> SubsLoader.setPref(a, l) }
+                p.trackSelectionParameters = p.trackSelectionParameters.buildUpon().setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
+                    .setOverrideForType(TrackSelectionOverride(g.mediaTrackGroup, i)).build()
             }
-            var n = 0
-            subs.forEach { g -> for (i in 0 until g.length) { val k = n++; Option(name(g, i, k), !textOff && g.isTrackSelected(i)) { select(g, i) } } }
-            if (subs.isEmpty()) MText("This video has no subtitles.", 12.5.sp, DialogColors.body)
+        }
+    }
+    val menu = Subs.menu(inPlayer.map { it.first }, available, java.util.Locale.getDefault().language)
+    val anyOn = menu.any { it.selected }
+    BlazeDialog("Subtitles and audio", confirm = "Done", onConfirm = onDismiss, onDismiss = onDismiss) {
+        Column(Modifier.fillMaxWidth().heightIn(max = 460.dp).verticalScroll(rememberScrollState())) {
+            MText("Subtitles", 12.sp, DialogColors.body, FontWeight.Medium)
+            Option("Off", !anyOn) { a.subtitlesOff() }
+            menu.forEach { m ->
+                val action = inPlayer.firstOrNull { it.first.id == m.id }?.second
+                Option(m.label + if (busy == m.id) "  · loading…" else "", m.selected) { if (action != null) action() else a.chooseSubtitle(m) }
+            }
+            if (menu.isEmpty()) MText("This video has no subtitles of its own. Load a .srt or .vtt file.", 12.5.sp, DialogColors.body, maxLines = 3)
+            if (err.isNotBlank()) MText(err, 12.5.sp, Color(0xFFE5484D), maxLines = 3)
+            Option("Load a subtitle file (.srt, .vtt)…", false) { a.openSubtitleFile() }
             Spacer(Modifier.height(10.dp))
             MText("Audio", 12.sp, DialogColors.body, FontWeight.Medium)
-            n = 0
-            audio.forEach { g -> for (i in 0 until g.length) { val k = n++; Option(name(g, i, k), g.isTrackSelected(i)) { select(g, i) } } }
+            var m2 = 0
+            audio.forEach { g -> for (i in 0 until g.length) { val k = m2++; Option(name(g, i, k), g.isTrackSelected(i)) {
+                p.trackSelectionParameters = p.trackSelectionParameters.buildUpon().setOverrideForType(TrackSelectionOverride(g.mediaTrackGroup, i)).build()
+            } } }
         }
     }
 }
@@ -536,6 +916,29 @@ private fun VideoLibrary(a: VideoActivity) {
                             Spacer(Modifier.height(4.dp))
                             MText(t.title, 12.5.sp, c.ink, FontWeight.Medium)
                             MText("${TimeText.clock(MediaLib.position(t.key))} watched", 11.5.sp, c.sub)
+                        }
+                    }
+                }
+            }
+        }
+        // v0.34.0 episode grouping: series (two or more episodes) in order, with what's next to watch.
+        val series = if (q.isBlank()) VideoSmart.series(videos) else emptyList()
+        series.forEach { (name, eps) ->
+            item(span = { GridItemSpan(maxLineSpan) }, key = "series-$name") {
+                Column {
+                    val upto = eps.indexOfLast { MediaLib.position(it.key) > 0 || it.key in recent }.coerceAtLeast(0)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        MText("$name \u00b7 ${eps.size} episodes", 15.sp, c.ink, FontWeight.SemiBold, modifier = Modifier.weight(1f))
+                        PillButton(if (upto > 0) "Continue" else "Play", primary = false) { a.play(eps[upto]) }
+                    }
+                    Spacer(Modifier.height(6.dp))
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        items(eps, key = { "s" + it.key }) { t ->
+                            Column(Modifier.width(150.dp).clip(BlazeShapes.small).clickable { a.play(t) }) {
+                                Art(t, Modifier.fillMaxWidth().aspectRatio(16f / 9f), target = 300)
+                                val e = VideoSmart.episode(t.title)
+                                MText(if (e != null) "S${e.season} \u00b7 E${e.episode}" else t.title, 12.sp, c.ink, FontWeight.Medium)
+                            }
                         }
                     }
                 }

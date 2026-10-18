@@ -129,7 +129,7 @@ fun LinuxDesktopPage(preview: LinuxDesktop.State? = null) {
             killed -> DesktopPlan.KILLED_NOTE
             paused -> DesktopFlow.pausedLine(kept, distro.name)
             st.phase == Phase.ERROR -> st.error
-            st.phase == Phase.RUNNING -> "${distro.name} \u00b7 ${DesktopPlan.WIDTH}\u00d7${DesktopPlan.HEIGHT}, 16-bit colour, only reachable from this phone."
+            st.phase == Phase.RUNNING -> "${distro.name} \u00b7 ${LinuxDesktop.running.label}, only reachable from this phone."
             st.phase == Phase.INSTALLING -> "${distro.name} \u00b7 You can leave this page or turn the screen off. Stop download keeps what's downloaded."
             preview == null && LinuxDesktop.installed() -> "Light defaults for phones with 3\u20134 GB of memory. Stop it when you're done to free memory."
             else -> "First start installs ${distro.name}: " + distro.sizeLine()
@@ -180,6 +180,8 @@ fun LinuxDesktopPage(preview: LinuxDesktop.State? = null) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         options.forEach { d -> DistroCard(d, picked = d.id == distro.id, enabled = canSwitch) { if (LinuxDesktop.setDistro(d.id)) note = "" } }
     }
+    // v0.34.0: apps, store, display, snapshots, auto-restart.
+    if (preview == null && desktopInstalled) { Spacer(Modifier.height(18.dp)); DesktopExtrasSection(st.phase) }
     Spacer(Modifier.height(18.dp))
     GroupHead("How it works", "")
     Text("Tap to click, two fingers to right-click or scroll, pinch to zoom and drag to pan when zoomed. The keyboard button types; the arrow turns it sideways.",
@@ -214,10 +216,17 @@ fun DesktopViewer(onClose: () -> Unit) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     var frame by remember { mutableIntStateOf(0) }
+    var clipNote by remember { mutableStateOf("") }
+    val clipboard = remember { ctx.getSystemService(android.content.ClipboardManager::class.java) }
+    val main = remember { android.os.Handler(android.os.Looper.getMainLooper()) }
     var drawn by remember { mutableIntStateOf(0) }
     var error by remember { mutableStateOf("") }
     val client = remember {
-        Rfb.Client(LinuxDesktop.password, onFrame = { frame++ }, onClosed = { r -> error = r; if (r.isNotBlank()) LinuxDesktop.lost() })
+        Rfb.Client(LinuxDesktop.password, onFrame = { frame++ }, onClosed = { r -> error = r; if (r.isNotBlank()) LinuxDesktop.lost() },
+            // v0.34.0 two-way clipboard: what's copied in the desktop lands on the phone's clipboard.
+            onCutText = { t -> if (t.isNotEmpty()) main.post {
+                try { clipboard?.setPrimaryClip(android.content.ClipData.newPlainText("Linux desktop", t)); clipNote = "Copied from the desktop" } catch (_: Exception) { }
+            } })
     }
     val bmp = remember { mutableStateOf<Bitmap?>(null) }
     var landscape by remember { mutableStateOf(false) }
@@ -316,11 +325,23 @@ fun DesktopViewer(onClose: () -> Unit) {
             // Controls: keyboard, rotate, close, stop.
             Row(Modifier.align(Alignment.TopEnd).statusBarsPadding().padding(10.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 ViewerChip("\u2328", "Keyboard") { keyboard = !keyboard }
+                // v0.34.0: the phone's clipboard into the desktop (then paste there with Ctrl+V, or Ctrl+Shift+V in the terminal).
+                ViewerChip("\u2398", "Send the phone's clipboard to the desktop") {
+                    val t = try { clipboard?.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(ctx)?.toString() } catch (_: Exception) { null }
+                    if (t.isNullOrEmpty()) clipNote = "The phone's clipboard is empty"
+                    else { client.cutText(t); clipNote = "Sent to the desktop's clipboard \u00b7 paste with Ctrl+V" }
+                }
                 ViewerChip("\u21bb", "Turn sideways") { landscape = !landscape }
                 ViewerChip("\u2715", "Close the viewer (keeps the desktop running)") { onClose() }
                 ViewerChip("\u25a0", "Stop the desktop and free memory") { scope.launch { LinuxDesktop.stop() }; onClose() }
             }
             if (keyboard) KeyInput(client, Modifier.align(Alignment.BottomCenter).navigationBarsPadding())
+            if (clipNote.isNotBlank()) {
+                LaunchedEffect(clipNote) { delay(2500); clipNote = "" }
+                Text(clipNote, Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom = if (keyboard) 96.dp else 24.dp)
+                    .clip(BlazeShapes.pill).background(Color(0xCC141416)).padding(horizontal = 14.dp, vertical = 8.dp),
+                    style = TextStyle(fontFamily = Type.Sans, fontSize = 13.sp, color = Color.White))
+            }
             // v0.25.5: what Blaze is doing, when it's working in the desktop you're watching.
             val live by com.blaze.assistant.desktop.DesktopLive.state.collectAsState()
             var tick by remember { mutableIntStateOf(0) }

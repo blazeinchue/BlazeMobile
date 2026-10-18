@@ -60,6 +60,17 @@ data class StoreDetail(
     val formats: List<StoreFormat>,
     val licence: String = "",
     val licenceUrl: String = "",
+    /** v0.34.0: subtitle / caption tracks the source offers (YouTube captions), side-loaded by the player. */
+    val subtitles: List<StoreSubtitle> = emptyList(),
+)
+
+/** v0.34.0: one subtitle track a source offers: [url] gives the text (any format Subs.parse reads). */
+data class StoreSubtitle(
+    val id: String,              // stable within the item ("yt-.en", "yt-a.en", "file-…")
+    val url: String,
+    val lang: String,            // BCP-47 code, "" when unknown
+    val name: String,            // "English", "English (auto-generated)", a file name
+    val auto: Boolean = false,   // machine-made (YouTube auto-captions, AI translation)
 )
 
 /** One "Download" option: one stream (audio / progressive video / a track) or two (video then audio, merged). */

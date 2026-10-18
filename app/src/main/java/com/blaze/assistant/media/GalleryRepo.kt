@@ -189,6 +189,9 @@ object GalleryRepo {
                         title = name.substringBeforeLast('.').replace('_', ' ').ifBlank { name }, kind = kind, src = src, time = mod * 1000,
                         size = c.getLong(iSize), durationMs = if (iDur >= 0) c.getLong(iDur) else 0,
                         width = if (iW >= 0) c.getInt(iW) else 0, height = if (iH >= 0) c.getInt(iH) else 0, folder = rel)
+                    // v0.34.0 big camera rolls (10k+): the grid fills page by page (first 600, then every 2000) while the rest loads.
+                    val n = out.size
+                    if (n == 600 || (n > 600 && (n - 600) % 2000 == 0)) _phone.value = out.toList()
                 }
             }
         } catch (_: Exception) { }

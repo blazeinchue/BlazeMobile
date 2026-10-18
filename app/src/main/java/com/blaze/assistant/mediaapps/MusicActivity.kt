@@ -48,6 +48,11 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Add
+import androidx.compose.material.icons.rounded.GraphicEq
+import androidx.compose.material.icons.rounded.BlurOn
+import androidx.compose.material.icons.rounded.Mic
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.material.icons.rounded.Bedtime
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Delete
@@ -285,7 +290,8 @@ fun MusicApp(ctl: MediaController?, tab: String, onTab: (String) -> Unit, onClos
 
 private fun playStream(ctl: MediaController?, item: StoreItem, d: StoreDetail, src: StoreSource) {
     val p = ctl ?: return
-    val f = src.streamPick("audio", d).firstOrNull() ?: return
+    // v0.34.0 data saver: the smallest stream on mobile data.
+    val f = VideoSmart.streamFor("audio", d, src, MusicService.current?.let { MediaPrefs.saving(it) } ?: false).firstOrNull() ?: return
     MusicService.current?.streamUa(src.userAgent)
     Taste.note(MusicService.current, "audio", d.title.ifBlank { item.title }, d.author.ifBlank { item.author }, Taste.PLAY)
     val t = Track("stream:${item.source}:${item.id}", f.url, d.title.ifBlank { item.title }, d.author.ifBlank { item.author }, item.extra["album"].orEmpty(),
@@ -327,6 +333,11 @@ private fun PlayerPage(ctl: MediaController?, np: NowPlaying) {
     val liked by MediaLib.liked.collectAsState()
     var sleepMenu by remember { mutableStateOf(false) }
     val sleepAt by MusicService.sleepAt.collectAsState()
+    var eqMenu by remember { mutableStateOf(false) }
+    var fadeMenu by remember { mutableStateOf(false) }
+    var eqName by remember { mutableStateOf(MediaPrefs.str(ctx, MediaPrefs.EQ, "Flat")) }
+    var fadeS by remember { mutableIntStateOf(MediaPrefs.int(ctx, MediaPrefs.CROSSFADE, 0)) }
+    var sleepFade by remember { mutableStateOf(MediaPrefs.bool(ctx, MediaPrefs.SLEEP_FADE, true)) }
 
     // Artwork-driven colour: the cover's dominant colour tints the page.
     val art = rememberArt(t, 320)
@@ -352,6 +363,7 @@ private fun PlayerPage(ctl: MediaController?, np: NowPlaying) {
                 when (v) {
                     "queue" -> QueueList(ctl, np)
                     "lyrics" -> LyricsView(t, np.pos)
+                    "karaoke" -> LyricsView(t, np.pos, karaoke = true)
                     else -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                         Art(t, Modifier.widthIn(max = 380.dp).fillMaxWidth().aspectRatio(1f), BlazeShapes.large, target = 720)
                     }
@@ -411,9 +423,22 @@ private fun PlayerPage(ctl: MediaController?, np: NowPlaying) {
                     if (sleepAt != 0L) add("Turn off" to { MusicService.sleepAt.value = 0L })
                     SleepTimer.presetsMin.forEach { m -> add("$m minutes" to { MusicService.sleepAt.value = System.currentTimeMillis() + m * 60_000L }) }
                     add("End of this song" to { MusicService.sleepAt.value = -1L })
+                    add((if (sleepFade) "Fade out at the end: on" else "Fade out at the end: off") to { sleepFade = !sleepFade; MediaPrefs.setBool(ctx, MediaPrefs.SLEEP_FADE, sleepFade) })
                 })
             }
+            Box {
+                Chip(if (eqName == "Flat") "EQ" else eqName, Icons.Rounded.GraphicEq, eqName != "Flat") { eqMenu = true }
+                BlazeMenu(eqMenu, { eqMenu = false }, MusicSmart.presets.keys.map { n ->
+                    (n + if (n == eqName) "  \u2713" else "") to { eqName = n; MediaPrefs.setStr(ctx, MediaPrefs.EQ, n); MusicService.current?.applyEq(n); Unit } })
+            }
+            Box {
+                Chip(if (fadeS == 0) "Fade" else "Fade ${fadeS} s", Icons.Rounded.BlurOn, fadeS > 0) { fadeMenu = true }
+                BlazeMenu(fadeMenu, { fadeMenu = false }, listOf(0, 3, 6, 10).map { sec ->
+                    ((if (sec == 0) "No fade between songs" else "Fade $sec s between songs") + if (sec == fadeS) "  \u2713" else "") to {
+                        fadeS = sec; MediaPrefs.setInt(ctx, MediaPrefs.CROSSFADE, sec); Unit } })
+            }
             Chip("Lyrics", Icons.Rounded.FormatQuote, view == "lyrics") { view = if (view == "lyrics") "art" else "lyrics" }
+            Chip("Karaoke", Icons.Rounded.Mic, view == "karaoke") { view = if (view == "karaoke") "art" else "karaoke" }
             Chip("Queue", Icons.Rounded.KeyboardArrowDown, view == "queue") { view = if (view == "queue") "art" else "queue" }
         }
     }
@@ -474,7 +499,7 @@ private fun QueueList(ctl: MediaController?, np: NowPlaying) {
 }
 
 @Composable
-private fun LyricsView(t: Track, pos: Long) {
+private fun LyricsView(t: Track, pos: Long, karaoke: Boolean = false) {
     val c = LocalBlaze.current
     val ctx = LocalContext.current
     var res by remember(t.key) { mutableStateOf<Lyrics.Result?>(null) }
@@ -492,6 +517,8 @@ private fun LyricsView(t: Track, pos: Long) {
         r == null -> MText("Looking for lyrics\u2026", 14.sp, c.sub)
         r.instrumental -> MText("Instrumental", 16.sp, c.sub)
         r.empty -> MText("No lyrics found for this song.", 14.sp, c.sub)
+        karaoke && r.synced.isEmpty() -> MText("Karaoke needs synced lyrics, and this song only has plain ones.", 14.sp, c.sub, maxLines = 3)
+        karaoke -> KaraokeView(r.synced, pos)
         r.synced.isNotEmpty() -> {
             val cur = Lrc.current(r.synced, pos)
             val list = rememberLazyListState()
@@ -522,7 +549,7 @@ private fun LibraryPage(np: NowPlaying, playList: (List<Track>, Int, Boolean) ->
     val liked by MediaLib.liked.collectAsState()
     val recent by MediaLib.recent.collectAsState()
     val lists by MediaLib.playlists.collectAsState()
-    var section by remember { mutableStateOf("songs") }
+    var section by remember { mutableStateOf("foryou") }
     var q by remember { mutableStateOf("") }
     var group by remember { mutableStateOf<String?>(null) }
     var openList by remember { mutableStateOf<String?>(null) }
@@ -559,7 +586,7 @@ private fun LibraryPage(np: NowPlaying, playList: (List<Track>, Int, Boolean) ->
         KitSearch(q, { q = it; group = null; openList = null }, "Search your music")
         Spacer(Modifier.height(8.dp))
         Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            listOf("songs" to "Songs", "liked" to "Liked", "artists" to "Artists", "albums" to "Albums", "playlists" to "Playlists").forEach { (id, label) ->
+            listOf("foryou" to "For you", "songs" to "Songs", "liked" to "Liked", "artists" to "Artists", "albums" to "Albums", "playlists" to "Playlists").forEach { (id, label) ->
                 val on = section == id
                 Box(Modifier.clip(BlazeShapes.pill).background(if (on) c.ink else c.faint).clickable { section = id; group = null; openList = null }
                     .padding(horizontal = 14.dp, vertical = 7.dp)) { MText(label, 13.sp, if (on) c.paper else c.sub, FontWeight.Medium) }
@@ -573,6 +600,7 @@ private fun LibraryPage(np: NowPlaying, playList: (List<Track>, Int, Boolean) ->
                     if (found.isEmpty()) item { EmptyState("No match", "Nothing in your library matches \u201c$q\u201d. Try the Store.") }
                     itemsIndexed(found, key = { _, t -> "q" + t.key }) { i, t -> SongRow(t, found, i) }
                 }
+                section == "foryou" -> item { ForYou(songs, liked, playList) }
                 section == "songs" -> {
                     val rec = recent.mapNotNull { byKey[it] }.take(15)
                     if (rec.isNotEmpty()) {
@@ -715,3 +743,107 @@ private fun LibraryPage(np: NowPlaying, playList: (List<Track>, Int, Boolean) ->
 
 /** Songs waiting to go into a playlist that's being created from "Add to playlist → New playlist". */
 private var pendingAdd: List<String>? = null
+
+// ---------------- v0.34.0 karaoke + For you ----------------
+
+/** Karaoke: the line being sung, big, filling left to right as it goes; the next line under it. */
+@Composable
+private fun KaraokeView(lines: List<LyricLine>, pos: Long) {
+    val c = LocalBlaze.current
+    val cur = Lrc.current(lines, pos)
+    val line = lines.getOrNull(cur)
+    val next = lines.getOrNull(cur + 1)
+    val start = line?.ms ?: 0L
+    val end = next?.ms ?: (start + 4_000)
+    val frac = if (line == null || end <= start) 0f else ((pos - start).toFloat() / (end - start)).coerceIn(0f, 1f)
+    Column(Modifier.fillMaxSize().padding(vertical = 24.dp), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) {
+        val text = line?.text?.ifBlank { "\u266A" } ?: "\u266A"
+        Box {
+            MText(text, 30.sp, c.weak, FontWeight.Bold, maxLines = 4)
+            MText(text, 30.sp, c.accent, FontWeight.Bold, maxLines = 4, modifier = Modifier.drawWithContent {
+                clipRect(right = size.width * frac) { this@drawWithContent.drawContent() } })
+        }
+        Spacer(Modifier.height(22.dp))
+        MText(next?.text.orEmpty(), 19.sp, c.sub, FontWeight.Medium, maxLines = 3)
+        Spacer(Modifier.height(30.dp))
+        MText("Karaoke \u00b7 lyrics: LRCLIB", 11.sp, c.weak)
+    }
+}
+
+/** For you: Blaze DJ, daily mixes, smart playlists, Wrapped, playlist import and the tag fixer. */
+@Composable
+private fun ForYou(songs: List<Track>, liked: List<String>, playList: (List<Track>, Int, Boolean) -> Unit) {
+    val c = LocalBlaze.current
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val plays by MediaLib.plays.collectAsState()
+    val byKey = remember(songs) { songs.associateBy { it.key } }
+    val now = remember(plays.size) { System.currentTimeMillis() }
+    val mixes = remember(songs, plays.size) { MusicSmart.dailyMixes(songs, plays, now / 86_400_000L) }
+    val smart = remember(songs, plays.size, liked) { MusicSmart.smartLists(songs, plays, liked, now) }
+    var wrapped by remember { mutableStateOf<String?>(null) }
+    var importing by remember { mutableStateOf(false) }
+    var busy by remember { mutableStateOf("") }
+    Column(Modifier.fillMaxWidth().padding(top = 4.dp)) {
+        Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            PillButton("Blaze DJ", primary = true) {
+                val svc = MusicService.current
+                if (svc == null) android.widget.Toast.makeText(ctx, "Play any song first, then start Blaze DJ.", android.widget.Toast.LENGTH_SHORT).show()
+                else { svc.startDj(true); android.widget.Toast.makeText(ctx, "Blaze DJ is on: it keeps the music going with songs you love.", android.widget.Toast.LENGTH_SHORT).show() }
+            }
+            PillButton("Wrapped", primary = false) { wrapped = MusicExtras.wrappedText(MusicExtras.wrapped("year")) }
+            PillButton("Import playlist", primary = false) { importing = true }
+            PillButton(if (busy.isNotBlank()) busy else "Fix tags & covers", primary = false) {
+                if (busy.isNotBlank()) return@PillButton
+                busy = "Fixing\u2026"
+                scope.launch {
+                    val r = MusicExtras.fixTags(ctx) { i, n -> busy = "Fixing $i of $n" }
+                    busy = ""
+                    android.widget.Toast.makeText(ctx, "Checked ${r.checked} songs: ${r.renamed} renamed, ${r.covers} new covers.", android.widget.Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+        if (songs.isEmpty()) { Spacer(Modifier.height(16.dp)); EmptyState("Nothing to mix yet", "Download songs in the Store or import a playlist; mixes and smart playlists build from what you play.") }
+        @Composable
+        fun ListRow(l: MusicSmart.SmartList) {
+            val tracks = l.keys.mapNotNull { byKey[it] }
+            if (tracks.isEmpty()) return
+            Row(Modifier.fillMaxWidth().padding(vertical = 4.dp).clip(BlazeShapes.small).clickable { playList(tracks, 0, false) }.padding(8.dp),
+                verticalAlignment = Alignment.CenterVertically) {
+                Art(tracks.first(), Modifier.size(52.dp), BlazeShapes.small, target = 140)
+                Spacer(Modifier.width(12.dp))
+                Column(Modifier.weight(1f)) {
+                    MText(l.name, 14.5.sp, c.ink, FontWeight.SemiBold)
+                    MText("${l.about} \u00b7 ${tracks.size} songs", 12.sp, c.sub)
+                }
+                RoundIcon(Icons.Rounded.Shuffle, "Shuffle ${l.name}", size = 40, tint = c.sub) { playList(tracks, tracks.indices.random(), true) }
+            }
+        }
+        if (mixes.isNotEmpty()) { Spacer(Modifier.height(12.dp)); MText("Daily mixes", 15.sp, c.ink, FontWeight.SemiBold); mixes.forEach { ListRow(it) } }
+        if (smart.isNotEmpty()) { Spacer(Modifier.height(12.dp)); MText("Smart playlists", 15.sp, c.ink, FontWeight.SemiBold); smart.forEach { ListRow(it) } }
+    }
+    wrapped?.let { w -> BlazeDialog("Your Wrapped", w, confirm = "Nice", onConfirm = { wrapped = null }, onDismiss = { wrapped = null }) }
+    if (importing) ImportDialog { importing = false }
+}
+
+@Composable
+private fun ImportDialog(onDismiss: () -> Unit) {
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var text by remember { mutableStateOf("") }
+    var busy by remember { mutableStateOf(false) }
+    var msg by remember { mutableStateOf("") }
+    BlazeDialog("Import a playlist", "Paste a YouTube or Spotify playlist link (Spotify albums work too). Blaze finds each song, downloads it and builds the playlist.",
+        confirm = if (busy) "Importing\u2026" else if (msg.isNotBlank()) "Done" else "Import", onConfirm = {
+            if (msg.isNotBlank()) { onDismiss(); return@BlazeDialog }
+            if (busy || text.isBlank()) return@BlazeDialog
+            busy = true
+            scope.launch {
+                msg = try { MusicExtras.importPlaylist(ctx, text.trim()) } catch (e: Exception) { "Couldn't import: ${e.message ?: "no connection"}" }
+                busy = false
+            }
+        }, dismiss = "Cancel", onDismiss = onDismiss) {
+        BlazeTextField(text, { text = it; msg = "" }, "https://open.spotify.com/playlist/\u2026", Modifier.fillMaxWidth())
+        if (msg.isNotBlank()) { Spacer(Modifier.height(8.dp)); MText(msg, 13.sp, DialogColors.body, maxLines = 8) }
+    }
+}

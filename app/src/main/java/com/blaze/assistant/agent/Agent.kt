@@ -934,6 +934,10 @@ When you finish, say what you did in one short sentence.
         if (com.blaze.assistant.notify.NotificationBrain.instance != null) com.blaze.assistant.notify.Conversations.tools().forEach { t.put(it) }
         t.put(com.blaze.assistant.life.LifeLogs.tool())
         t.put(com.blaze.assistant.mediaapps.MediaFetch.tool())
+        t.put(com.blaze.assistant.mediaapps.VideoTools.tool())   // v0.34.0
+        t.put(com.blaze.assistant.mediaapps.MusicTools.tool())   // v0.34.0
+        t.put(com.blaze.assistant.media.GalleryOps.tool())   // v0.34.0
+        t.put(com.blaze.assistant.device.CameraMathTool.tool())   // v0.34.0
         t.put(com.blaze.assistant.notify.MoneyRadar.tool())
         t.put(com.blaze.assistant.phone.SafeWalk.tool())
         t.put(com.blaze.assistant.device.PhoneHealth.tool())
@@ -3501,6 +3505,14 @@ When you finish, say what you did in one short sentence.
                         kotlinx.coroutines.withContext(Dispatchers.IO) { TimeCapsule.run(app, args) } }
                     name == com.blaze.assistant.notify.MoneyRadar.TOOL -> { add(Role.STEP, "Checking Money Radar")
                         kotlinx.coroutines.withContext(Dispatchers.IO) { com.blaze.assistant.notify.MoneyRadar.run(app, args) } }
+                    name == com.blaze.assistant.device.CameraMathTool.TOOL -> { add(Role.STEP, "Working it out")
+                        com.blaze.assistant.device.CameraMathTool.run(args) }
+                    name == com.blaze.assistant.media.GalleryOps.TOOL -> { add(Role.STEP, com.blaze.assistant.media.GalleryOps.describe(args))
+                        com.blaze.assistant.media.GalleryOps.run(app, args) }
+                    name == com.blaze.assistant.mediaapps.MusicTools.TOOL -> { add(Role.STEP, com.blaze.assistant.mediaapps.MusicTools.describe(args))
+                        com.blaze.assistant.mediaapps.MusicTools.run(app, args) }
+                    name == com.blaze.assistant.mediaapps.VideoTools.TOOL -> { add(Role.STEP, com.blaze.assistant.mediaapps.VideoTools.describe(args))
+                        com.blaze.assistant.mediaapps.VideoTools.run(app, args) }
                     name == com.blaze.assistant.mediaapps.MediaFetch.TOOL -> { add(Role.STEP, com.blaze.assistant.mediaapps.MediaFetch.describe(args))
                         kotlinx.coroutines.withContext(Dispatchers.IO) { com.blaze.assistant.mediaapps.MediaFetch.run(app, args) } }
                     name == com.blaze.assistant.life.LifeLogs.TOOL -> { add(Role.STEP, com.blaze.assistant.life.LifeLogs.describe(args))

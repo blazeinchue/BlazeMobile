@@ -53,6 +53,8 @@ class BlazeApp : Application() {
         com.blaze.assistant.routine.Routines.init(this)
         // v0.29.0 Home board: widgets + cached content in blaze.db, refreshed by WorkManager (≥ 1 h).
         com.blaze.assistant.home.HomeBoard.init(this)
+        // v0.33.2 BlazeOS (Home's virtual phone): reads and once migrates its bos_* prefs; its disk opens at boot.
+        try { com.blaze.assistant.blazeos.BlazeOs.init(this) } catch (_: Throwable) { }
         com.blaze.assistant.notify.Notifier.init(this)
         try { com.blaze.assistant.update.Updater.checkInBackground(this) } catch (_: Throwable) { }
         Settings.tellIfSecretsDropped()

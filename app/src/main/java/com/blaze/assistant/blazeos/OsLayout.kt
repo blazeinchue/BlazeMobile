@@ -239,6 +239,17 @@ object OsIcons {
     /** Largest icon bitmap kept (px): plenty for a 60 dp icon on an xhdpi A12, small enough for its RAM. */
     const val MAX_PX = 144
 
+    /**
+     * The decode sample (a power of two) that shrinks a [w] x [h] picture as far as possible while its shorter side
+     * stays at or above [maxPx], so the final exact scale-down starts from the least pixels (icons, wallpaper, photos).
+     */
+    fun sampleSize(w: Int, h: Int, maxPx: Int): Int {
+        var s = 1
+        if (maxPx <= 0) return 1
+        while (minOf(w, h) / (s * 2) >= maxPx) s *= 2
+        return s
+    }
+
     /** Bitmap size for an icon of [dp] at [density], capped at [MAX_PX] (never below 24). */
     fun sizePx(dp: Float, density: Float, cap: Int = MAX_PX): Int = (dp * density).toInt().coerceIn(24, cap)
 

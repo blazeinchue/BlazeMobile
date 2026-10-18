@@ -498,7 +498,10 @@ fun ChatScreen() {
                     animationSpec = MotionTokens.medium(), label = "tab") { paneNow ->
                 if (paneNow == "home") {
                     // v0.29.0 Home board: plain-words asks go to Blaze in the main chat (home_widget_* tools).
-                    HomePane(onAsk = { t -> Agent.send(t) }, onQuote = { t -> quote = t; go(navNow().switchTab(ChatNav.CHAT)) })
+                    // v0.33.2: Home is BlazeOS, Blaze's own virtual phone (fullscreen); the old board stays as "Classic board".
+                    val osPrefs by com.blaze.assistant.blazeos.BlazeOs.prefs.collectAsState()
+                    if (osPrefs.classic) HomePane(onAsk = { t -> Agent.send(t) }, onQuote = { t -> quote = t; go(navNow().switchTab(ChatNav.CHAT)) })
+                    else com.blaze.assistant.blazeos.BlazeOsCard()
                 } else if (paneNow == "projects") {
                     val needs = remember(question, allChats) { question?.let { q -> allChats.filter { it.title == q.chat }.map { it.id }.toSet() } ?: emptySet() }
                     ProjectsPane(projects, allChats, busyChats, needs, nav.project,

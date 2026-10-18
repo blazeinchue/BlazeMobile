@@ -170,6 +170,11 @@ class OsLayoutTest {
         assertNull(OsIcons.parseColor("zzzzzz"))
         assertEquals("#4DA3FF", OsIcons.hex(0xFF4DA3FFL))
         assertEquals("squircle", OsIcons.normShape("blob"))
+        // Decode sampling: a 4000 x 3000 photo for a 1280 px wallpaper decodes at 1/2 (1500 short side), an icon at 1/8.
+        assertEquals(2, OsIcons.sampleSize(4000, 3000, 1280))
+        assertEquals(16, OsIcons.sampleSize(4000, 3000, 144))
+        assertEquals(1, OsIcons.sampleSize(100, 100, 144))
+        assertEquals(1, OsIcons.sampleSize(100, 100, 0))
         assertEquals("circle", OsIcons.normShape("Circle"))
     }
 

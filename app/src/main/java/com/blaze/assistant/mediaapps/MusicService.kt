@@ -65,6 +65,8 @@ class MusicService : MediaSessionService() {
 
     fun streamUa(ua: String) { http.setUserAgent(ua) }
     private lateinit var player: ExoPlayer
+    /** v0.33.2 BlazeOS: the player for the now-playing widget, BlazeOS's own volume and Pause (same process; null before onCreate). */
+    val livePlayer: androidx.media3.common.Player? get() = if (::player.isInitialized) player else null
     private val main = Handler(Looper.getMainLooper())
     private val sleepTick = object : Runnable {
         override fun run() {

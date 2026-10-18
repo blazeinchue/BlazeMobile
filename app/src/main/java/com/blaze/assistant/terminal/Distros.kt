@@ -23,8 +23,8 @@ object Distros {
 
     fun installedIds(): Set<String> = TermLogic.DISTROS.map { it.id }.filter { runCatching { installed(it) }.getOrDefault(false) }.toSet()
 
-    suspend fun install(id: String): String = withContext(Dispatchers.IO) {
-        if (id == "alpine") return@withContext Linux.install()
+    suspend fun install(id: String, stop: StopToken = StopToken()): String = withContext(Dispatchers.IO) {
+        if (id == "alpine") return@withContext Linux.install(stop)
         val d = TermLogic.distro(id) ?: return@withContext "Unknown Linux: $id"
         if (!Linux.supported()) return@withContext "This phone's CPU isn't supported for Linux."
         val cpu = TermLogic.cpu(abi()); val url = cpu?.let { d.urls[it] } ?: return@withContext "${d.name} isn't built for this phone's CPU."
@@ -34,12 +34,15 @@ object Distros {
         val txz = File(Linux.base().apply { mkdirs() }, ".dl-$id.tar.xz")   // filesDir, not cache: big downloads survive a cache trim and resume
         try {
             Terminal.setup()
-            status.value = "Downloading ${d.name}…"
+            val resumed = File(txz.path + ".part").let { it.exists() && it.length() > 0 }
+            status.value = if (resumed) "Resuming ${d.name}…" else "Downloading ${d.name}…"
             try {
+                // v0.33.5: resumes from .part (filesDir), and Stop (the Desktop page / notification) pauses it.
                 Fetch.download(listOf(url), txz, "", progress = { got, total, retry ->
-                    status.value = retry ?: if (total > 0) "Downloading ${d.name}… ${got * 100 / total}% of ${total / 1_000_000} MB" else "Downloading ${d.name}…"
-                })
+                    status.value = retry ?: Fetch.mbLine(d.name, got, total, resumed)
+                }, sleep = stop.sleep, open = stop::open, cancelled = stop.cancelled)
             } catch (e: Exception) {
+                if (e is Fetch.StoppedException) return@withContext "Download paused.".also { status.value = "Download paused" }
                 return@withContext "${Fetch.reason(e)}, so ${d.name} didn't finish downloading. Tap install again to carry on.".also { status.value = it }
             }
             status.value = "Unpacking ${d.name}…"

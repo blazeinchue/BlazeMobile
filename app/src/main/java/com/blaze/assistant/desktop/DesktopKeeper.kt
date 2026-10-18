@@ -35,8 +35,41 @@ class DesktopKeeper : Service() {
 
     companion object {
         private const val ID = 79
+        /** v0.33.5: the "Download paused" notification (not ongoing; tap opens Blaze, Resume carries on). */
+        private const val PAUSED_ID = 80
         private const val CHANNEL = "blaze_desktop"
+        const val ACTION_STOP = "com.blaze.assistant.desktop.STOP_DOWNLOAD"
+        const val ACTION_RESUME = "com.blaze.assistant.desktop.RESUME_DOWNLOAD"
         @Volatile var wanted = false; private set
+
+        private fun channel(ctx: Context) {
+            if (Build.VERSION.SDK_INT >= 26) ctx.getSystemService(NotificationManager::class.java)
+                .createNotificationChannel(NotificationChannel(CHANNEL, "Linux desktop download", NotificationManager.IMPORTANCE_LOW))
+        }
+
+        private fun openApp(ctx: Context, req: Int): PendingIntent? = ctx.packageManager.getLaunchIntentForPackage(ctx.packageName)?.let {
+            PendingIntent.getActivity(ctx, req, it, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        }
+
+        /** v0.33.5: "Download paused · 41.2 MB kept" with Resume, after Stop. */
+        fun showPaused(ctx: Context, keptBytes: Long) {
+            try {
+                channel(ctx)
+                val name = LinuxDesktop.distro().name
+                val resume = Intent(ctx, DesktopKeeper::class.java).setAction(ACTION_RESUME)
+                val pi = if (Build.VERSION.SDK_INT >= 26) PendingIntent.getForegroundService(ctx, PAUSED_ID, resume, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+                    else PendingIntent.getService(ctx, PAUSED_ID, resume, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+                val n = NotificationCompat.Builder(ctx, CHANNEL).setSmallIcon(R.drawable.ic_stat_blaze)
+                    .setContentTitle(DesktopFlow.PAUSED_LINE).setContentText(DesktopFlow.pausedLine(keptBytes, name))
+                    .setStyle(NotificationCompat.BigTextStyle().bigText(DesktopFlow.pausedLine(keptBytes, name)))
+                    .setOnlyAlertOnce(true).setSilent(true).setAutoCancel(true)
+                    .addAction(0, "Resume", pi)
+                    .also { b -> openApp(ctx, PAUSED_ID)?.let { b.setContentIntent(it) } }.build()
+                ctx.getSystemService(NotificationManager::class.java).notify(PAUSED_ID, n)
+            } catch (_: Exception) { }
+        }
+
+        fun clearPaused(ctx: Context) { try { ctx.getSystemService(NotificationManager::class.java).cancel(PAUSED_ID) } catch (_: Exception) { } }
 
         fun start(ctx: Context) {
             wanted = true
@@ -53,26 +86,43 @@ class DesktopKeeper : Service() {
     override fun onBind(i: Intent?): IBinder? = null
 
     private fun note(line: String, pct: Int?): Notification {
-        val nm = getSystemService(NotificationManager::class.java)
-        if (Build.VERSION.SDK_INT >= 26) nm.createNotificationChannel(NotificationChannel(CHANNEL, "Linux desktop download", NotificationManager.IMPORTANCE_LOW))
-        val open = packageManager.getLaunchIntentForPackage(packageName)?.let {
-            PendingIntent.getActivity(this, ID, it, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
-        }
+        channel(this)
+        val open = openApp(this, ID)
+        // v0.33.5: Stop pauses the download (what's downloaded is kept; Start or Resume carries on).
+        val stop = PendingIntent.getService(this, ID + 100, Intent(this, DesktopKeeper::class.java).setAction(ACTION_STOP),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         return NotificationCompat.Builder(this, CHANNEL).setSmallIcon(R.drawable.ic_stat_blaze)
             .setContentTitle("Setting up the Linux desktop").setContentText(line.ifBlank { "Downloading\u2026" })
             .setStyle(NotificationCompat.BigTextStyle().bigText(line.ifBlank { "Downloading\u2026" } + "\nYou can turn the screen off; Blaze keeps going."))
             .setProgress(100, pct ?: 0, pct == null).setOngoing(true).setOnlyAlertOnce(true).setSilent(true)
+            .addAction(0, "Stop", stop)
             .also { b -> open?.let { b.setContentIntent(it) } }.build()
     }
 
     private fun current(): Pair<String, Int?> {
         val s = LinuxDesktop.state.value
         val linux = com.blaze.assistant.terminal.Linux
-        return if (linux.installing.value) linux.status.value to s.pct else s.line to s.pct
+        return when {
+            linux.installing.value -> linux.status.value to s.pct
+            com.blaze.assistant.terminal.Distros.installing.value != null -> com.blaze.assistant.terminal.Distros.status.value to s.pct
+            else -> s.line to s.pct
+        }
     }
 
     @Suppress("DEPRECATION")
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        when (intent?.action) {
+            ACTION_STOP -> {
+                // The notification's Stop: pause the download; the loop below ends the service once it has stopped.
+                LinuxDesktop.stopInstall(applicationContext)
+                if (!wanted) { stopSelf(); return START_NOT_STICKY }
+            }
+            ACTION_RESUME -> {
+                clearPaused(applicationContext)
+                wanted = true
+                LinuxDesktop.startAsync(applicationContext)
+            }
+        }
         try {
             val (l, p) = current()
             if (Build.VERSION.SDK_INT >= 29) startForeground(ID, note(l, p), ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC) else startForeground(ID, note(l, p))
@@ -90,7 +140,7 @@ class DesktopKeeper : Service() {
             while (true) {
                 delay(1000)
                 val ph = LinuxDesktop.state.value.phase
-                val busy = com.blaze.assistant.terminal.Linux.installing.value || ph == Phase.INSTALLING
+                val busy = com.blaze.assistant.terminal.Linux.installing.value || com.blaze.assistant.terminal.Distros.installing.value != null || ph == Phase.INSTALLING
                 if (!wanted || !busy) { stopSelf(); break }
                 val (l, p) = current()
                 val key = "$l|$p"

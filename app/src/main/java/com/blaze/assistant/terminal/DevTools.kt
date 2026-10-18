@@ -190,7 +190,7 @@ object DevTools {
             }
         }
         val runner = when (lang) { "python" -> "python3 -u snippet.py"; "node" -> "node snippet.js"; else -> "sh snippet.sh" }
-        return Terminal.run("${setup}cd /root/phone/.blaze/run && $runner", timeout, true)
+        return Terminal.run("${setup}cd /root/phone/.blaze/run && $runner", timeout, true, distro = "alpine")
     }
 
     // ---------- network ----------
@@ -261,7 +261,7 @@ object DevTools {
         val sb = StringBuilder()
         sb.append("Phone shell: ").append(if (Terminal.busyboxOk) "sh + BusyBox" else "sh + Android toybox (BusyBox unavailable)").append(". Working folder: ").append(show(Terminal.agentCwd())).append('\n')
         sb.append("Alpine Linux: ").append(when { Linux.installed() -> "installed (${Linux.sizeMb()} MB)"; Linux.supported() -> "not installed (run_code or linux_install sets it up)"; else -> "not supported on this CPU" }).append('\n')
-        if (Linux.installed()) sb.append(Terminal.run("for t in python3 pip3 node npm git curl gcc make java; do printf '%s: ' \$t; command -v \$t >/dev/null && echo yes || echo no; done; df -h /root 2>/dev/null | tail -1", 30, true).removePrefix("exit 0").trim()).append('\n')
+        if (Linux.installed()) sb.append(Terminal.run("for t in python3 pip3 node npm git curl gcc make java; do printf '%s: ' \$t; command -v \$t >/dev/null && echo yes || echo no; done; df -h /root 2>/dev/null | tail -1", 30, true, distro = "alpine").removePrefix("exit 0").trim()).append('\n')
         sb.append("Termux: ").append(if (Terminal.termuxInstalled(app)) "installed" else "not installed").append('\n')
         sb.append("Free space: ").append("%.1f".format(home().usableSpace / 1e9)).append(" GB\n")
         sb.append(Terminal.listJobs())

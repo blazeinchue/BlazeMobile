@@ -104,7 +104,7 @@ object Git {
             else -> return@withContext "Unknown git action $action."
         }
         val needsAuth = action in setOf("clone", "pull", "push") || (action == "raw" && Regex("""\b(push|pull|fetch|clone|ls-remote)\b""").containsMatchIn(a.optString("args")))
-        var out = Terminal.run(setup.toString() + cmd, if (action in setOf("clone", "push", "pull", "raw")) 300 else 90, true)
+        var out = Terminal.run(setup.toString() + cmd, if (action in setOf("clone", "push", "pull", "raw")) 300 else 90, true, distro = "alpine")
         if (token != null) out = out.replace(token, "***")
         if (needsAuth && Regex("(?i)(authentication failed|could not read username|403|permission to .* denied)").containsMatchIn(out))
             out += if (token == null) "\n[hint: GitHub isn't connected in Blaze. Ask the user to connect GitHub in Settings → Connections, then retry.]"

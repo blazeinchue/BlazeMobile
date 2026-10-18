@@ -16,6 +16,8 @@ import org.json.JSONObject
  *            | { "type": "web", "url": "https://example.org/app/" }       a hosted web app (https only)
  *            | { "type": "builtin", "key": "clock" }                       a Kotlin app built into BlazeOS
  *            | { "type": "linux", "command": "xeyes", "packages": ["xeyes"] }   runs in the Linux desktop (proot)
+ *              optional "distro_packages": { "ubuntu": ["x11-apps"], "fedora": ["xeyes"] } (v0.33.5: names for the other
+ *              Linuxes; without it Alpine's names are mapped by DesktopDistro.mapPackages)
  *     "permissions": ["storage", "notifications", "camera", "mic"],
  *     "description": "…", "author": "…", "category": "Games"
  *   }
@@ -26,7 +28,7 @@ import org.json.JSONObject
 data class OsIcon(val glyph: String = "", val from: String = "", val to: String = "", val file: String = "")
 
 data class OsEntry(val type: String, val path: String = "", val url: String = "", val key: String = "", val command: String = "",
-                   val packages: List<String> = emptyList())
+                   val packages: List<String> = emptyList(), val distroPackages: Map<String, List<String>> = emptyMap())
 
 data class OsManifestData(
     val id: String,
@@ -60,6 +62,9 @@ object OsManifest {
     private val VERSION = Regex("^\\d{1,4}(\\.\\d{1,4}){0,3}$")
     private val COMMAND = Regex("^[A-Za-z0-9 ._/+=:,-]{1,120}$")
     private val PKG = Regex("^[a-z0-9][a-z0-9.+-]{0,63}$")
+    /** Fedora has capitals (Thunar, ImageMagick). */
+    private val DPKG = Regex("^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$")
+    private val DISTRO_ID = Regex("^[a-z][a-z0-9-]{0,31}$")
 
     /** Either a manifest or the reason it was refused. */
     sealed class Parsed {
@@ -108,7 +113,11 @@ object OsManifest {
             LINUX -> {
                 val cmd = e.optString("command").trim()
                 val pk = strings(e.optJSONArray("packages"))
-                if (!COMMAND.matches(cmd) || pk.any { !PKG.matches(it) }) null else OsEntry(LINUX, command = cmd, packages = pk)
+                val dp = e.optJSONObject("distro_packages")?.let { o ->
+                    o.keys().asSequence().filter { DISTRO_ID.matches(it) }.associateWith { k -> strings(o.optJSONArray(k)).filter { DPKG.matches(it) } }
+                        .filterValues { it.isNotEmpty() }
+                } ?: emptyMap()
+                if (!COMMAND.matches(cmd) || pk.any { !PKG.matches(it) }) null else OsEntry(LINUX, command = cmd, packages = pk, distroPackages = dp)
             }
             else -> null
         }
@@ -136,6 +145,7 @@ object OsManifest {
             if (m.entry.key.isNotEmpty()) put("key", m.entry.key)
             if (m.entry.command.isNotEmpty()) put("command", m.entry.command)
             if (m.entry.packages.isNotEmpty()) put("packages", JSONArray(m.entry.packages))
+            if (m.entry.distroPackages.isNotEmpty()) put("distro_packages", JSONObject().apply { m.entry.distroPackages.forEach { (k, v) -> put(k, JSONArray(v)) } })
         })
         .put("permissions", JSONArray(m.permissions))
         .put("description", m.description).put("author", m.author).put("category", m.category)

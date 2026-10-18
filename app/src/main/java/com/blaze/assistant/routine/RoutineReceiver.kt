@@ -50,7 +50,7 @@ class RoutineService : Service() {
         suspend fun runRoutine(id: Int) {
             val r = Routines.get(id) ?: return
             if (r.isCommand) {
-                val out = try { com.blaze.assistant.terminal.Terminal.run(r.command, 600, r.linux) } catch (e: Exception) { "exit 1\nError: ${e.message}" }
+                val out = try { com.blaze.assistant.terminal.Terminal.run(r.command, 600, r.linux, distro = "alpine") } catch (e: Exception) { "exit 1\nError: ${e.message}" }
                 val failed = !out.startsWith("exit 0")
                 com.blaze.assistant.terminal.Terminal.logAgent("[scheduled: ${r.name}] $ ${r.command}", out)
                 if (r.notify == "always" || (r.notify == "on_failure" && failed)) {

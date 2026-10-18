@@ -58,6 +58,7 @@ object Fetch {
     fun reason(e: Throwable): String {
         val m = (e.message ?: "").lowercase()
         return when {
+            e is StoppedException -> "Stopped"
             e is java.net.UnknownHostException || "unable to resolve" in m -> "Can't reach the download server"
             e is java.net.SocketTimeoutException || "timed out" in m || "timeout" in m -> "The connection went quiet"
             "no space" in m || "enospc" in m -> "The phone is out of space"
@@ -68,6 +69,14 @@ object Fetch {
 
     class ChecksumException(msg: String) : IOException(msg)
     class HttpException(val code: Int) : IOException("HTTP $code")
+    /** v0.33.5: the user tapped Stop. The .part file stays, so the next call resumes from it. */
+    class StoppedException : IOException("stopped")
+
+    /** A sleep that wakes within half a second of [cancelled] turning true. */
+    fun stoppableSleep(cancelled: () -> Boolean): (Long) -> Unit = { ms ->
+        var left = ms
+        while (left > 0 && !cancelled()) { val d = minOf(left, 500L); Thread.sleep(d); left -= d }
+    }
 
     /** Progress: bytes so far, total (or -1), and an optional retry line ("Connection dropped. Retrying (2 of 6)…"). */
     fun interface Progress { fun on(got: Long, total: Long, retry: String?) }
@@ -77,7 +86,8 @@ object Fetch {
      * Throws the last error when every try fails; partial bytes stay in `<dest>.part` for the next call to resume.
      */
     fun download(urls: List<String>, dest: File, sha256: String, tries: Int = TRIES, progress: Progress = Progress { _, _, _ -> },
-                 sleep: (Long) -> Unit = { Thread.sleep(it) }, open: (String) -> HttpURLConnection = { URL(it).openConnection() as HttpURLConnection }): File {
+                 sleep: (Long) -> Unit = { Thread.sleep(it) }, open: (String) -> HttpURLConnection = { URL(it).openConnection() as HttpURLConnection },
+                 cancelled: () -> Boolean = { false }): File {
         require(urls.isNotEmpty())
         val part = File(dest.path + ".part")
         dest.parentFile?.mkdirs()
@@ -88,19 +98,22 @@ object Fetch {
         var idx = 0; var failsHere = 0; val missing = HashSet<Int>()
         fun advance() { var k = 0; do { idx = (idx + 1) % urls.size; k++ } while (idx in missing && k <= urls.size); failsHere = 0 }
         for (attempt in 1..tries) {
+            if (cancelled()) throw StoppedException()
             val url = urls[idx]
             val prev = last
             if (attempt > 1 && prev != null && !(prev is HttpException && notHere(prev.code))) {
                 val wait = backoffSec(attempt)
                 progress.on(part.length(), -1, "${reason(last!!)}. Retrying ($attempt of $tries)\u2026")
-                if (wait > 0) sleep(wait * 1000L)
+                if (wait > 0) sleep(wait * 1000L)   // a caller with a Stop passes a sleep that wakes early (Fetch.stoppableSleep)
+                if (cancelled()) throw StoppedException()
             }
             try {
-                once(url, part, progress, open)
+                once(url, part, progress, open, cancelled)
                 if (sha256.isNotBlank() && sha256(part) != sha256) { part.delete(); throw ChecksumException("checksum mismatch") }
                 dest.delete()
                 if (!part.renameTo(dest)) { part.copyTo(dest, overwrite = true); part.delete() }
                 return dest
+            } catch (e: StoppedException) { throw e
             } catch (e: HttpException) {
                 last = e
                 if (e.code == 416) part.delete()   // what we have is bigger than the file: start over
@@ -110,13 +123,13 @@ object Fetch {
                     advance(); continue
                 }
                 failsHere++
-            } catch (e: Exception) { last = e; failsHere++ }
+            } catch (e: Exception) { if (cancelled()) throw StoppedException(); last = e; failsHere++ }
             if (failsHere >= 2 && urls.size - missing.size > 1) advance()
         }
         throw last ?: IOException("download failed")
     }
 
-    private fun once(url: String, part: File, progress: Progress, open: (String) -> HttpURLConnection) {
+    private fun once(url: String, part: File, progress: Progress, open: (String) -> HttpURLConnection, cancelled: () -> Boolean = { false }) {
         val have = if (part.exists()) part.length() else 0L
         val c = open(url)
         c.connectTimeout = CONNECT_TIMEOUT_MS; c.readTimeout = READ_TIMEOUT_MS
@@ -136,6 +149,7 @@ object Fetch {
                 c.inputStream.use { inp ->
                     val buf = ByteArray(64 * 1024)
                     while (true) {
+                        if (cancelled()) throw StoppedException()
                         val n = inp.read(buf); if (n < 0) break
                         out.write(buf, 0, n); got += n
                         progress.on(got, total, null)

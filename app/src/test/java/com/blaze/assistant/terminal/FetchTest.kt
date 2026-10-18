@@ -93,6 +93,31 @@ class FetchTest {
         assertFalse(File(dir, "a.tgz.part").exists())
     }
 
+    @Test fun stopKeepsThePartFileAndTheNextCallResumes() {
+        // v0.33.5: Stop on the desktop download throws StoppedException at once (no retry) and keeps the .part.
+        var stop = false
+        try {
+            Fetch.download(listOf(url("/good")), File(dir, "s.tgz"), sha, progress = { got, _, _ -> if (got > 0) stop = true },
+                sleep = { fail("no retry wait after Stop") }, cancelled = { stop })
+            fail("should have stopped")
+        } catch (_: Fetch.StoppedException) { }
+        val part = File(dir, "s.tgz.part")
+        assertTrue(part.exists() && part.length() > 0 && part.length() < body.size)
+        assertEquals(1, ranges.size)
+        assertEquals("Stopped", Fetch.reason(Fetch.StoppedException()))
+        val f = Fetch.download(listOf(url("/good")), File(dir, "s.tgz"), sha, sleep = { })
+        assertArrayEquals(body, f.readBytes())
+        assertTrue(ranges[1]!!.removePrefix("bytes=").removeSuffix("-").toLong() > 0)
+    }
+
+    @Test fun stoppableSleepWakesEarly() {
+        var stop = false
+        val t0 = System.currentTimeMillis()
+        Thread { Thread.sleep(200); stop = true }.start()
+        Fetch.stoppableSleep { stop }(30_000)
+        assertTrue(System.currentTimeMillis() - t0 < 5_000)
+    }
+
     @Test fun startsOverCleanlyWhenTheServerIgnoresRange() {
         cutFirst = 1; honourRange = false
         val f = Fetch.download(listOf(url("/good")), File(dir, "b.tgz"), sha, sleep = { })

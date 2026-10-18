@@ -79,8 +79,18 @@ object DesktopPlan {
     /** v0.33.3: turns on apk's package cache (/etc/apk/cache → /var/cache/apk). */
     const val APK_CACHE = "mkdir -p /var/cache/apk && { [ -e /etc/apk/cache ] || ln -s /var/cache/apk /etc/apk/cache; }"
 
+    /**
+     * v0.33.5: the same command names in every Linux. Debian / Ubuntu ship Xtigervnc + tigervncpasswd (Xvnc / vncpasswd
+     * come from update-alternatives, which a half-finished install may lack); ImageMagick 7 (Arch) may only have `magick`.
+     * Links go in /usr/local/bin and are only made when the plain name is missing, so Alpine is untouched.
+     */
+    const val SHIMS = "(set +e; mkdir -p /usr/local/bin; " +
+        "command -v Xvnc >/dev/null 2>&1 || { X=\$(command -v Xtigervnc) && ln -sf \"\$X\" /usr/local/bin/Xvnc; }; " +
+        "command -v vncpasswd >/dev/null 2>&1 || { X=\$(command -v tigervncpasswd) && ln -sf \"\$X\" /usr/local/bin/vncpasswd; }; " +
+        "command -v import >/dev/null 2>&1 || { command -v magick >/dev/null 2>&1 && printf '#!/bin/sh\\nexec magick import \"\$@\"\\n' > /usr/local/bin/import && chmod 755 /usr/local/bin/import; }; true) >/dev/null 2>&1 || true"
+
     /** The last step: folders the session needs, and the "installed" mark. */
-    const val FINISH_SCRIPT = "set -e\nmkdir -p /root/.vnc /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix\n" +
+    const val FINISH_SCRIPT = "set -e\nmkdir -p /root/.vnc /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix\n" + SHIMS + "\n" +
         "touch /root/.blaze_desktop_ok\necho BLAZE_DESKTOP_INSTALLED"
 
     /** The whole install as one script (first mirror, no retries), for reference and the agent; the app runs it step by step ([DesktopInstall]). */
@@ -90,8 +100,9 @@ object DesktopPlan {
 
     const val INSTALLED_MARK = "/root/.blaze_desktop_ok"
 
+
     /** The password file Xvnc reads, written with TigerVNC's own `vncpasswd -f` (the password arrives on stdin, never in argv). */
-    fun passwdScript(pw: String): String = "mkdir -p /root/.vnc && printf '%s\\n' '${pw.filter { it.isLetterOrDigit() }}' | vncpasswd -f > /root/.vnc/passwd && chmod 600 /root/.vnc/passwd"
+    fun passwdScript(pw: String): String = SHIMS + "\nmkdir -p /root/.vnc && printf '%s\\n' '${pw.filter { it.isLetterOrDigit() }}' | vncpasswd -f > /root/.vnc/passwd && chmod 600 /root/.vnc/passwd"
 
     /** Xvnc's arguments: localhost only, password auth, no TCP X11, light resolution and depth. */
     fun xvncArgs(w: Int = WIDTH, h: Int = HEIGHT, depth: Int = DEPTH): List<String> = listOf(
@@ -101,7 +112,7 @@ object DesktopPlan {
 
     /** Starts the X server, waits for it, then the XFCE session (the job runs as long as the session does). */
     fun startScript(w: Int = WIDTH, h: Int = HEIGHT, depth: Int = DEPTH): String =
-        "rm -f /tmp/.X1-lock /tmp/.X11-unix/X1\n" +
+        SHIMS + "\nrm -f /tmp/.X1-lock /tmp/.X11-unix/X1; mkdir -p /tmp/.X11-unix; chmod 1777 /tmp/.X11-unix\n" +
             xvncArgs(w, h, depth).joinToString(" ") + " >/tmp/xvnc.log 2>&1 &\n" +
             "for i in $(seq 1 40); do [ -e /tmp/.X11-unix/X1 ] && break; sleep 0.25; done\n" +
             "export DISPLAY=$DISPLAY XDG_RUNTIME_DIR=/tmp/xdg; mkdir -p /tmp/xdg; chmod 700 /tmp/xdg\n" +
@@ -110,9 +121,9 @@ object DesktopPlan {
 
     /** Stops everything the desktop started and frees its memory. */
     const val STOP_SCRIPT = "pkill -f xfce4-session; pkill -f xfwm4; pkill -f xfdesktop; pkill -f xfce4-panel; pkill -f Thunar; " +
-        "pkill -f dillo; pkill -f dbus-daemon; pkill -f Xvnc; rm -f /tmp/.X1-lock /tmp/.X11-unix/X1; echo stopped"
+        "pkill -f dillo; pkill -f dbus-daemon; pkill -f Xvnc; pkill -f Xtigervnc; rm -f /tmp/.X1-lock /tmp/.X11-unix/X1; echo stopped"
 
-    const val ALIVE_SCRIPT = "[ -e /tmp/.X11-unix/X1 ] && pgrep -f Xvnc >/dev/null && echo up || echo down"
+    const val ALIVE_SCRIPT = "[ -e /tmp/.X11-unix/X1 ] && pgrep -f 'Xvnc|Xtigervnc' >/dev/null && echo up || echo down"
 
     // ---------- agent tool lines (xdotool + ImageMagick) ----------
     private fun q(s: String) = "'" + s.replace("'", "'\\''") + "'"
@@ -136,7 +147,7 @@ object DesktopPlan {
     }
 
     // ---------- plain words ----------
-    enum class Phase { IDLE, CHECKING, INSTALLING, STARTING, RUNNING, STOPPING, STOPPED, KILLED, ERROR, UNSUPPORTED }
+    enum class Phase { IDLE, CHECKING, INSTALLING, STARTING, RUNNING, STOPPING, STOPPED, KILLED, ERROR, UNSUPPORTED, PAUSED }
 
     /** One plain line for an apk / start log line ("(12/96) Installing gtk+3.0" → "Installing gtk+3.0 (12 of 96)"). */
     fun progressLine(log: String): Pair<Int?, String>? {

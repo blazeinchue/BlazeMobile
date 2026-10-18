@@ -106,7 +106,7 @@ object BlazeRouter {
                 if (!dst.exists() || dst.length() != bin.length()) { bin.copyTo(dst, overwrite = true); dst.setExecutable(true) }
                 File(home(ctx), ".keys.in").apply { writeText(keys); setReadable(true, true) }
                 val cmd = "K=\"\$(cat /root/phone/.blaze/.keys.in)\"; rm -f /root/phone/.blaze/.keys.in; BLAZE_KEYS=\"\$K\" exec /root/phone/.blaze/bin/blazerouter --home /root/phone/.blaze"
-                val out = com.blaze.assistant.terminal.Terminal.startJob(cmd, linux = true, maxMinutes = 0)
+                val out = com.blaze.assistant.terminal.Terminal.startJob(cmd, linux = true, maxMinutes = 0, distro = "alpine")
                 jobId = Regex("\\d+").find(out)?.value?.toIntOrNull() ?: 0
                 if (out.contains("rror", true)) out else null
             }

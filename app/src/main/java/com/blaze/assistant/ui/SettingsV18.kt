@@ -203,7 +203,8 @@ fun TerminalPage() {
     }
     V18Note(when {
         showBlaze -> "Every command Blaze runs for you, live, with its output. Read-only."
-        mode == "linux" -> "Alpine Linux. Try: apk update && apk add python3, then python3. Your phone's Blaze files are in ~/phone."
+        mode == "linux" -> com.blaze.assistant.terminal.Terminal.defaultDistro().let { d -> if (d == "alpine") "Alpine Linux. Try: apk update && apk add python3, then python3. Your phone's Blaze files are in ~/phone."
+            else "${com.blaze.assistant.terminal.TermLogic.distro(d)?.name ?: d} (your chosen Linux). Install software with ${com.blaze.assistant.terminal.Terminal.installHint(d)}. Your phone's Blaze files are in ~/phone." }
         else -> "Android sh plus ~300 BusyBox tools (vi, wget, tar, grep, awk, nc, httpd…). Tab completes file names; ↑ ↓ walk your history." })
     Box(Modifier.fillMaxWidth().height(380.dp).clip(BlazeShapes.medium).background(androidx.compose.ui.graphics.Color(0xFF111110)).padding(12.dp)) {
         Text(if (showBlaze) agentOut.ifEmpty { "Nothing yet. When Blaze runs a command, it shows up here." } else out.ifEmpty { "Starting the shell…" },

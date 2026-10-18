@@ -1,0 +1,368 @@
+package com.blaze.assistant.ui
+
+import android.annotation.SuppressLint
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
+import kotlinx.coroutines.launch
+import java.io.File
+import androidx.compose.ui.draw.clip
+
+/** Turns what Blaze passed (URL, ~/path, relative path, absolute path) into something WebView can load. */
+fun designUrl(target: String, home: File?): String {
+    val t = target.trim()
+    if (t.isEmpty()) return ""
+    if (Regex("^(https?|file|about|data):", RegexOption.IGNORE_CASE).containsMatchIn(t)) return t
+    if (Regex("^(localhost|127\\.0\\.0\\.1)(:\\d+)?(/.*)?$").matches(t)) return "http://$t"
+    val f = when {
+        t.startsWith("~/") && home != null -> File(home, t.removePrefix("~/"))
+        t.startsWith("/") -> File(t)
+        home != null -> File(home, t)
+        else -> File(t)
+    }
+    return "file://" + (if (f.isDirectory) File(f, "index.html") else f).absolutePath
+}
+
+/**
+ * v0.23.2: three.js works offline. 3D designs import three.js from a CDN (importmap); the Design view
+ * serves those requests from copies bundled in the APK (assets/design/three, three.js r170, MIT), so a
+ * scene opens with no network and never waits on the CDN. Returns the asset name for [url], or null.
+ */
+fun bundledThree(url: String): String? {
+    val u = url.substringBefore('?').substringBefore('#')
+    if (!Regex("^https?://(cdn\\.jsdelivr\\.net|unpkg\\.com|cdnjs\\.cloudflare\\.com|esm\\.sh|ga\\.jspm\\.io)/", RegexOption.IGNORE_CASE).containsMatchIn(u)) return null
+    if (!u.contains("three", ignoreCase = true)) return null
+    return when {
+        Regex("/build/three\\.module(\\.min)?\\.js$").containsMatchIn(u) || Regex("/three\\.js/r?[\\d.]+/three\\.module(\\.min)?\\.js$").containsMatchIn(u) -> "three.module.min.js"
+        u.endsWith("/examples/jsm/controls/OrbitControls.js") || u.endsWith("/addons/controls/OrbitControls.js") -> "OrbitControls.js"
+        u.endsWith("/examples/jsm/exporters/GLTFExporter.js") || u.endsWith("/addons/exporters/GLTFExporter.js") -> "GLTFExporter.js"
+        // r162's GLTFExporter imports ../utils/TextureUtils.js (only bundled with the r162 build).
+        u.endsWith("/examples/jsm/utils/TextureUtils.js") || u.endsWith("/addons/utils/TextureUtils.js") -> "TextureUtils.js"
+        else -> null
+    }
+}
+
+/** The blaze-parts spec of a 3D design file, or null (not a parts-based 3D design, or unreadable). */
+fun designSpec(target: String, home: File?): org.json.JSONObject? = try {
+    val u = designUrl(target, home)
+    if (!u.startsWith("file://")) null else File(u.removePrefix("file://")).takeIf { it.isFile && it.length() < 2_000_000 }
+        ?.let { com.blaze.assistant.agent.Designs.specFrom(it.readText()) }
+        ?.let { com.blaze.assistant.agent.Designs.normalizeSpec(it) }   // v0.23.5: known shapes, unique ids
+} catch (_: Exception) { null }
+
+/**
+ * v0.23.3: the JS bridge a Design page calls (window.BlazeDesign), injected by [DesignServe.HOOK_JS].
+ * Calls arrive on a WebView binder thread; they're posted to the main thread.
+ */
+class DesignBridge(private val onGl: (Int, Boolean, String) -> Unit, private val onError: (String) -> Unit,
+                   private val onReady: (String) -> Unit, private val onFail: (String) -> Unit) {
+    private val main = android.os.Handler(android.os.Looper.getMainLooper())
+    /** v0.28.2: set when the view leaves; later calls (and ones already posted) are dropped. */
+    @Volatile var disposed = false
+        private set
+    fun dispose() { disposed = true; main.removeCallbacksAndMessages(null) }
+    private fun post(f: () -> Unit) { if (!disposed) main.post { if (!disposed) f() } }
+    // Strings from the page are capped: the bridge only updates the view's state.
+    @android.webkit.JavascriptInterface fun gl(level: Int, gl1: Boolean, engine: String?) { val e = DesignServe.bridgeText(engine, 16); post { onGl(level.coerceIn(-1, 2), gl1, e) } }
+    @android.webkit.JavascriptInterface fun error(msg: String?) { val m = DesignServe.bridgeText(msg); post { onError(m) } }
+    @android.webkit.JavascriptInterface fun ready(engine: String?) { val e = DesignServe.bridgeText(engine, 16); post { onReady(e) } }
+    @android.webkit.JavascriptInterface fun fail(msg: String?) { val m = DesignServe.bridgeText(msg); post { onFail(m) } }
+}
+
+/** What the current attempt to draw a design has reported. */
+private class RenderState {
+    var ready by mutableStateOf(false)
+    var failure by mutableStateOf<String?>(null)
+    var forceGl1 by mutableStateOf(false)
+    var glLevel = -1
+    var gl1 = false
+    /** Read from the WebView's request thread (CDN fallback picks the same build as the page). */
+    @Volatile var engine: String? = null
+    val errors = ArrayList<String>()
+    var grace: kotlinx.coroutines.Job? = null
+    fun begin() { ready = false; failure = null; glLevel = -1; gl1 = false; engine = null; errors.clear(); grace?.cancel(); grace = null }
+}
+
+/**
+ * Design view: a live preview of what Blaze builds (HTML files, local servers, URLs), phone or
+ * desktop width, with a one-line box to ask for changes without leaving. Exit is in the top bar.
+ *
+ * v0.23.3: designs in Blaze's home load from a virtual https origin ([DesignServe]); 3D pages report
+ * ready / errors through [DesignBridge]; when three.js can't start, the view retries with the WebGL1 build
+ * and then draws the parts natively ([PartsSketchView]) with the real error and Retry, so a 3D design
+ * always shows something. Errors go to ~/designs/.last_error.txt for Blaze's design tool.
+ * [initialFailure] shows the fallback straight away (screenshots).
+ */
+@SuppressLint("SetJavaScriptEnabled")
+@Composable
+fun DesignView(target: String, busy: Boolean, status: String, onAsk: (String) -> Unit, onOpenInBrowser: (String) -> Unit, home: File?,
+               preview: Boolean = true, initialFailure: String? = null) {
+    val c = LocalBlaze.current
+    val fileUrl = remember(target, home) { designUrl(target, home) }
+    // v0.28.2: every page is served from the virtual origin (files outside Blaze's home too), so the WebView has no file access.
+    val url = remember(fileUrl, home) { DesignServe.servedUrl(fileUrl, home) }
+    val appData = androidx.compose.ui.platform.LocalContext.current.applicationInfo?.dataDir?.let { File(it) }
+    val extRoot = remember(fileUrl, home) { DesignServe.extRoot(fileUrl, home, appData) }
+    /** A link the page tried to open outside the design: offered as "Open in browser", never followed by itself. */
+    var external by remember(url) { mutableStateOf<String?>(null) }
+    var wide by remember { mutableStateOf(false) }
+    var reload by remember { mutableIntStateOf(0) }
+    var ask by remember { mutableStateOf("") }
+    val spec3d = remember(target, reload) { designSpec(target, home) }
+    val is3d = spec3d != null
+    val rs = remember(url) { RenderState().also { it.failure = initialFailure } }
+    val scope = androidx.compose.runtime.rememberCoroutineScope()
+    val errorFile = remember(home) { home?.let { File(File(it, "designs"), DesignServe.ERROR_FILE) } }
+
+    fun writeErrors() {
+        val f = errorFile ?: return
+        val text = DesignServe.errorReport(fileUrl.removePrefix("file://"), rs.engine, rs.glLevel, rs.errors.toList(), System.currentTimeMillis())
+        scope.launch(kotlinx.coroutines.Dispatchers.IO) { try { f.parentFile?.mkdirs(); f.writeText(text) } catch (_: Exception) { } }
+    }
+    fun restart(forceGl1: Boolean) { rs.forceGl1 = forceGl1; rs.begin(); reload++ }
+    fun fail(msg: String) {
+        if (rs.failure != null) return
+        rs.grace?.cancel()
+        if (rs.errors.none { it == msg }) rs.errors += msg
+        writeErrors()
+        val engine = if (rs.forceGl1) DesignServe.R162 else rs.engine
+        when (DesignServe.onFail(engine, rs.gl1, is3d)) {
+            DesignServe.Next.RETRY_WEBGL1 -> restart(true)
+            else -> { rs.ready = false; rs.failure = msg }
+        }
+    }
+    fun noteError(msg: String, fatal: Boolean) {
+        if (rs.errors.size >= 20) rs.errors.removeAt(0)
+        rs.errors += msg
+        writeErrors()
+        if (!is3d || rs.failure != null) return
+        if (fatal) { fail(msg); return }
+        if (!rs.ready && rs.grace == null) rs.grace = scope.launch {
+            kotlinx.coroutines.delay(DesignServe.ERROR_GRACE_MS)
+            if (!rs.ready && rs.failure == null) fail(rs.errors.firstOrNull() ?: msg)
+        }
+    }
+
+    // When Blaze finishes a turn, show its latest version.
+    var wasBusy by remember { mutableStateOf(busy) }
+    androidx.compose.runtime.LaunchedEffect(busy) { if (wasBusy && !busy) restart(rs.forceGl1); wasBusy = busy }
+    // A 3D page has READY_TIMEOUT_MS to say it's drawing (the A12 parses three.js slowly).
+    androidx.compose.runtime.LaunchedEffect(url, wide, reload, preview) {
+        if (preview && is3d && rs.failure == null) {
+            kotlinx.coroutines.delay(DesignServe.READY_TIMEOUT_MS)
+            if (!rs.ready && rs.failure == null) fail("The 3D engine didn't start within ${DesignServe.READY_TIMEOUT_MS / 1000} s (" + (rs.engine?.ifBlank { null } ?: "no engine") + ").")
+        }
+    }
+    Column(Modifier.fillMaxSize().background(c.paper).glassBackground(c.dark)) {
+        Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp).glass(RoundedCornerShape(24.dp), GlassIntensity.Low, shadow = false).padding(horizontal = 8.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+            listOf(false to "Phone", true to "Desktop").forEach { (w, label) ->
+                val on = wide == w
+                Box(Modifier.clip(BlazeShapes.pill).then(if (on) Modifier.background(c.ink, BlazeShapes.pill) else Modifier.glass(BlazeShapes.pill, GlassIntensity.Low, shadow = false)).clickable { wide = w }.padding(horizontal = 10.dp, vertical = 6.dp)) {
+                    ButtonText(label, color = if (on) c.paper else c.ink, size = 13.sp)
+                }
+                Spacer(Modifier.width(6.dp))
+            }
+            Text(target.trim().ifBlank { "Nothing to preview yet" }.let { if (it.length > 34) "…" + it.takeLast(33) else it }, maxLines = 1,
+                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis, modifier = Modifier.weight(1f).padding(horizontal = 6.dp),
+                style = TextStyle(fontFamily = Type.Mono, fontSize = 11.sp, color = c.sub))
+            if (url.isNotBlank()) {
+                ActionText("Reload", color = c.accent, size = 9.sp, modifier = Modifier.clickable { restart(rs.forceGl1) }.padding(6.dp))
+                // "Open" hands the real file (or URL) to the browser, never the in-app virtual origin.
+                ActionText("Open", color = c.accent, size = 9.sp, modifier = Modifier.clickable { onOpenInBrowser(fileUrl) }.padding(6.dp))
+            }
+        }
+        Box(Modifier.weight(1f).fillMaxWidth().padding(top = 4.dp).glass(GlassTokens.tileShape, GlassIntensity.Low, shadow = false)) {
+            val failure = rs.failure
+            if (url.isBlank()) {
+                Column(Modifier.align(Alignment.Center).padding(32.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                    Label("Design")
+                    Spacer(Modifier.padding(4.dp))
+                    Text("Ask Blaze for anything visual: a 3D model, a site, an app screen, a diagram, a chart, a poster. It opens here.",
+                        style = TextStyle(fontFamily = Type.Sans, fontSize = 14.sp, color = c.sub))
+                }
+            } else if (spec3d != null && (!preview || failure != null)) {
+                // No WebGL (screenshots), or three.js couldn't start on this phone: draw the same parts natively.
+                // The banner sits under the drawing (not over it), so the whole model stays visible.
+                Column(Modifier.fillMaxSize()) {
+                    Box(Modifier.weight(1f).fillMaxWidth()) {
+                        PartsSketchView(spec3d)
+                        Label("3D \u00b7 " + spec3d.optString("name") + if (failure != null) " \u00b7 simple view" else "", color = c.sub, size = 9.sp,
+                            modifier = Modifier.align(Alignment.TopStart).padding(12.dp))
+                    }
+                    if (failure != null) FailBanner(failure, sketch = true, onRetry = { restart(false) })
+                }
+            } else if (preview) {
+                androidx.compose.runtime.key(url, wide, reload) {
+                    val loadUrl = DesignServe.attemptUrl(url, rs.forceGl1)
+                    val bridge = remember { DesignBridge(
+                                onGl = { level, gl1, engine -> rs.glLevel = level; rs.gl1 = gl1; rs.engine = engine },
+                                onError = { noteError(it, fatal = false) },
+                                onReady = { engine -> rs.grace?.cancel(); rs.grace = null; rs.ready = true; rs.engine = engine
+                                    try { errorFile?.delete() } catch (_: Exception) { } },
+                                onFail = { fail(it) }) }
+                    androidx.compose.runtime.DisposableEffect(bridge) { onDispose { bridge.dispose() } }
+                    AndroidView(modifier = Modifier.fillMaxSize(), factory = { ctx ->
+                        WebView(ctx).apply {
+                            settings.javaScriptEnabled = true
+                            settings.domStorageEnabled = true
+                            // v0.28.2: pages come from the virtual origin (shouldInterceptRequest), never file:// or content://.
+                            settings.allowFileAccess = false
+                            settings.allowContentAccess = false
+                            settings.useWideViewPort = wide
+                            settings.loadWithOverviewMode = wide
+                            settings.builtInZoomControls = true
+                            settings.displayZoomControls = false
+                            addJavascriptInterface(bridge, "BlazeDesign")
+                            webChromeClient = object : android.webkit.WebChromeClient() {
+                                override fun onConsoleMessage(m: android.webkit.ConsoleMessage): Boolean {
+                                    if (m.messageLevel() == android.webkit.ConsoleMessage.MessageLevel.ERROR) {
+                                        val t = m.message() ?: ""
+                                        // "Uncaught …" also reaches window.onerror, which the hook reports with more context.
+                                        if (!t.startsWith("Uncaught")) noteError("console: $t (" + (m.sourceId() ?: "").substringAfterLast('/') + ":" + m.lineNumber() + ")",
+                                            fatal = DesignServe.fatalConsole(t))
+                                        else if (DesignServe.fatalConsole(t)) noteError(t, fatal = true)
+                                    }
+                                    return false
+                                }
+                            }
+                            webViewClient = object : WebViewClient() {
+                                override fun shouldInterceptRequest(view: WebView, req: android.webkit.WebResourceRequest): android.webkit.WebResourceResponse? =
+                                    serveDesign(ctx, req.url.toString(), home, rs.engine, extRoot)
+                                // v0.28.2: the top frame stays on the design's origin; a tapped link elsewhere is offered, not followed.
+                                override fun shouldOverrideUrlLoading(view: WebView, req: android.webkit.WebResourceRequest): Boolean {
+                                    if (!req.isForMainFrame) return false
+                                    val next = req.url.toString()
+                                    if (DesignServe.allowNavigation(loadUrl, next)) return false
+                                    if (req.hasGesture() && (next.startsWith("https://") || next.startsWith("http://"))) external = next
+                                    return true
+                                }
+                                override fun onPageFinished(view: WebView, u: String?) {
+                                    if (wide) view.evaluateJavascript("(function(){var m=document.querySelector('meta[name=viewport]');" +
+                                        "if(!m){m=document.createElement('meta');m.name='viewport';document.head.appendChild(m);}m.content='width=1280';})()", null)
+                                }
+                            }
+                            // v0.26.1: a Mermaid file (also outside Blaze's home, where requests aren't served by us) is drawn as a picture.
+                            val mmd = if (fileUrl.startsWith("file://")) mermaidFile(File(fileUrl.removePrefix("file://"))) else null
+                            if (mmd != null) loadDataWithBaseURL(DesignServe.ORIGIN + "/", DesignServe.mermaidHtml(mmd, File(fileUrl).nameWithoutExtension), "text/html", "utf-8", null)
+                            else loadUrl(loadUrl)
+                        }
+                    })
+                }
+                if (failure != null) FailBanner(failure, sketch = false, onRetry = { restart(false) }, modifier = Modifier.align(Alignment.BottomCenter))
+                external?.let { link ->
+                    Row(Modifier.align(Alignment.TopCenter).fillMaxWidth().padding(10.dp).clip(BlazeShapes.pill).background(c.ink, BlazeShapes.pill)
+                        .padding(horizontal = 14.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text("Link to " + (DesignServe.originOf(link).substringAfter("://").ifBlank { "another site" }), maxLines = 1,
+                            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis, modifier = Modifier.weight(1f),
+                            style = TextStyle(fontFamily = Type.Sans, fontSize = 13.sp, color = c.paper))
+                        ActionText("Open in browser", color = c.paper, size = 9.sp, modifier = Modifier.clickable { external = null; onOpenInBrowser(link) }.padding(6.dp))
+                        ActionText("\u2715", color = c.paper, size = 9.sp, modifier = Modifier.clickable { external = null }.padding(6.dp))
+                    }
+                }
+            }
+        }
+        Row(Modifier.fillMaxWidth().hairlineTop(c.hair).padding(horizontal = 12.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+            Box(Modifier.weight(1f).clip(BlazeShapes.pill).background(c.field, BlazeShapes.pill).hairline(c.fieldLine, BlazeShapes.pill).padding(horizontal = 16.dp, vertical = 11.dp)) {
+                if (ask.isEmpty()) Text(if (busy) status.ifBlank { "Working…" } else "Ask for a change to this design", maxLines = 1,
+                    style = TextStyle(fontFamily = Type.Sans, fontSize = 14.sp, color = if (busy) c.accent else c.weak))
+                BasicTextField(ask, { ask = it }, maxLines = 4, cursorBrush = SolidColor(c.accent),
+                    textStyle = TextStyle(fontFamily = Type.Sans, fontSize = 14.sp, color = c.ink),
+                    keyboardOptions = ComposerKeys.Message,   // v0.28.1: Enter = new line; Send sends
+                    modifier = Modifier.fillMaxWidth())
+            }
+            Spacer(Modifier.width(8.dp))
+            BlazeButton("Send", enabled = ask.isNotBlank() && !busy) { onAsk(ask); ask = "" }
+        }
+    }
+}
+
+/** The "3D engine couldn't start" banner: the real error, what's shown instead, and Retry. */
+@Composable
+private fun FailBanner(error: String, sketch: Boolean, onRetry: () -> Unit, modifier: Modifier = Modifier) {
+    Row(modifier.fillMaxWidth().padding(12.dp).clip(BlazeShapes.medium).background(DialogColors.surface, BlazeShapes.medium).border(1.dp, DialogColors.border, BlazeShapes.medium)
+        .padding(horizontal = 12.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f)) {
+            Text("The 3D engine couldn't start: " + error.take(220), maxLines = 4, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                style = TextStyle(fontFamily = Type.Sans, fontSize = 12.sp, color = GlassTokens.warning))
+            if (sketch) Text("Showing a simple drawing instead: drag to turn, pinch to zoom.",
+                style = TextStyle(fontFamily = Type.Sans, fontSize = 11.sp, color = GlassTokens.sub))
+        }
+        Spacer(Modifier.width(8.dp))
+        Box(Modifier.clip(BlazeShapes.pill).background(GlassTokens.accent, BlazeShapes.pill).clickable { onRetry() }.padding(horizontal = 14.dp, vertical = 8.dp)) {
+            ButtonText("Retry", color = GlassTokens.onAccent, size = 13.sp)
+        }
+    }
+}
+
+/**
+ * Answers a Design view request: the virtual origin (designs, Blaze's home, bundled three.js) and CDN three.js
+ * URLs from the APK (the build matching [engine]). Null = let the network have it.
+ */
+fun serveDesign(ctx: android.content.Context, url: String, home: File?, engine: String?, ext: File? = null): android.webkit.WebResourceResponse? {
+    fun notFound() = android.webkit.WebResourceResponse("text/plain", "utf-8", 404, "Not Found", mapOf("Access-Control-Allow-Origin" to "*"), java.io.ByteArrayInputStream(ByteArray(0)))
+    fun ok(mime: String, data: java.io.InputStream, cache: String) = android.webkit.WebResourceResponse(mime,
+        if (mime.startsWith("text/") || mime.endsWith("json") || mime.endsWith("javascript")) "utf-8" else null, 200, "OK",
+        mapOf("Access-Control-Allow-Origin" to "*", "Cache-Control" to cache), data)
+    return try {
+        when (val t = DesignServe.resolve(url, home, ext)) {
+            is DesignServe.Target.Asset -> try { ok(t.mime, ctx.assets.open(t.path), "max-age=86400") } catch (_: Exception) { notFound() }
+            is DesignServe.Target.Disk -> when {
+                !t.file.isFile -> notFound()
+                t.mime == "text/html" -> {
+                    // v0.23.5: a page from an older stock starter is served from the current one (same parts).
+                    val html = com.blaze.assistant.agent.Designs.upgradeStarter(t.file.readText(),
+                        try { com.blaze.assistant.agent.Designs.templateLoader?.invoke() } catch (_: Exception) { null })
+                    val is3d = com.blaze.assistant.agent.Designs.specFrom(html) != null
+                    ok("text/html", java.io.ByteArrayInputStream(DesignServe.prepareHtml(html, is3d).toByteArray(Charsets.UTF_8)), "no-store")
+                }
+                // v0.26.1: a Mermaid file is drawn as a picture, never shown as raw source.
+                mermaidFile(t.file) != null -> ok("text/html", java.io.ByteArrayInputStream(
+                    DesignServe.mermaidHtml(mermaidFile(t.file)!!, t.file.nameWithoutExtension).toByteArray(Charsets.UTF_8)), "no-store")
+                else -> ok(t.mime, java.io.FileInputStream(t.file), "no-store")
+            }
+            null -> {
+                if (url.startsWith(DesignServe.ORIGIN, ignoreCase = true)) return notFound()
+                val name = bundledThree(url) ?: return null
+                val asset: java.io.InputStream = (try { ctx.assets.open(DesignServe.assetDir(engine ?: DesignServe.R170) + "/" + name) }
+                    catch (_: Exception) { try { ctx.assets.open("design/three/$name") } catch (_: Exception) { null } }) ?: return null
+                ok("text/javascript", asset, "max-age=86400")
+            }
+        }
+    } catch (_: Exception) { null }
+}
+
+/** The Mermaid source of a previewed file (see [DesignServe.mermaidSource]), or null. Small text files only. */
+fun mermaidFile(f: File): String? = try {
+    val ext = f.extension.lowercase()
+    if (!f.isFile || f.length() > 200_000 || ext !in setOf("mmd", "mermaid", "md", "markdown", "txt", "")) null
+    else DesignServe.mermaidSource(f.name, f.readText())
+} catch (_: Exception) { null }

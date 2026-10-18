@@ -1,0 +1,296 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+    # The Blaze Gateway Worker (gateway/) has its own workflow; changes only there don't rebuild the app.
+    paths-ignore: ['gateway/**', '.github/workflows/gateway.yml']
+  # Pull requests (including from forks) only build; they never publish, sign a release or edit issues.
+  pull_request:
+    branches: [main]
+    paths-ignore: ['gateway/**', '.github/workflows/gateway.yml']
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+# Read-only by default; only the publishing steps below run with write access, and only on this repo's main.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+    timeout-minutes: 45
+    env:
+      # The YouTube plug-in lives in the private repo lacksonkapapahue/Blaze-mobile and is checked out into youtube/.
+      # BLAZE_MOBILE_TOKEN = fine-grained PAT, Contents: read on Blaze-mobile. Missing (forks, or not set) = no YouTube.
+      HAS_BLAZE_MOBILE_TOKEN: ${{ secrets.BLAZE_MOBILE_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # YouTube Store plug-in (Gradle :youtube, only built when youtube/build.gradle.kts exists). Never fails the build:
+      # without the secret, or if the checkout fails, Blaze builds WITHOUT YouTube and the next step says so.
+      - name: Check out the YouTube plug-in (Blaze-mobile → youtube/)
+        id: yt_checkout
+        if: env.HAS_BLAZE_MOBILE_TOKEN == 'true'
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          repository: lacksonkapapahue/Blaze-mobile
+          ref: main
+          token: ${{ secrets.BLAZE_MOBILE_TOKEN }}
+          path: youtube
+          persist-credentials: false
+
+      - name: YouTube plug-in status
+        id: yt
+        run: |
+          if [ -f youtube/build.gradle.kts ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+            MSG="YouTube plug-in: INCLUDED (Blaze-mobile main @ $(git -C youtube rev-parse --short HEAD))"
+            echo "$MSG"; echo "### $MSG" >> "$GITHUB_STEP_SUMMARY"
+          else
+            rm -rf youtube
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            if [ "$HAS_BLAZE_MOBILE_TOKEN" != "true" ]; then WHY="the BLAZE_MOBILE_TOKEN secret is not available (not set, or a pull request from a fork)"
+            else WHY="checking out lacksonkapapahue/Blaze-mobile failed (token expired, revoked or without access?)"; fi
+            echo "::warning title=Building WITHOUT YouTube::$WHY. This APK has no YouTube Store."
+            echo "### YouTube plug-in: NOT included — $WHY. This APK has no YouTube Store." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ hashFiles('**/*.gradle.kts', 'gradle/wrapper/gradle-wrapper.properties') }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: blazerouter/go.mod
+          cache-dependency-path: |
+            wgproxy/go.sum
+            blazerouter/go.sum
+
+      # The browser VPN engine: user-space WireGuard + local HTTP proxy, shipped as an executable lib*.so
+      # (like the Needle runner) so Android unpacks it into nativeLibraryDir.
+      - name: Build wgproxy (browser VPN)
+        working-directory: wgproxy
+        run: |
+          go vet ./...
+          go test -count=1 ./...
+          CGO_ENABLED=0 GOOS=android GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o ../app/src/main/jniLibs/arm64-v8a/libwgproxy.so .
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build -trimpath -ldflags "-s -w" -o ../app/src/main/jniLibs/armeabi-v7a/libwgproxy.so .
+          ls -la ../app/src/main/jniLibs/*/libwgproxy.so
+
+      # BlazeRouter (Desktop's router, Go port of OmniRoute, MIT): same trick, libblazerouter.so,
+      # started by Blaze in Alpine, Termux or directly (agent/BlazeRouter.kt).
+      - name: Build BlazeRouter
+        working-directory: blazerouter
+        run: |
+          go vet .
+          go test -count=1 ./internal/router/
+          CGO_ENABLED=0 GOOS=android GOARCH=arm64 go build -trimpath -ldflags "-s -w -X main.version=$(grep -oP 'versionName = "\K[^"]+' ../app/build.gradle.kts)" -o ../app/src/main/jniLibs/arm64-v8a/libblazerouter.so .
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build -trimpath -ldflags "-s -w -X main.version=$(grep -oP 'versionName = "\K[^"]+' ../app/build.gradle.kts)" -o ../app/src/main/jniLibs/armeabi-v7a/libblazerouter.so .
+          ls -la ../app/src/main/jniLibs/*/libblazerouter.so
+
+      # v0.23.5: the three.js safety net and the 3D starter survive bad objects (node is preinstalled on ubuntu-latest).
+      - name: Design JS tests
+        run: node app/src/test/js/design-safe.test.mjs
+
+      - name: Build release APK
+        env:
+          ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+          # v0.30.5: the Jamendo Store's client_id ships inside the APK (BuildConfig.JAMENDO_CLIENT_ID) when this secret is set.
+          JAMENDO_CLIENT_ID: ${{ secrets.JAMENDO_CLIENT_ID }}
+        run: |
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+          chmod +x gradlew
+          set -o pipefail
+          YT_TEST=""; if [ "${{ steps.yt.outputs.present }}" = "true" ]; then YT_TEST=":youtube:test"; fi
+          ./gradlew testReleaseUnitTest :storeapi:test $YT_TEST assembleRelease --stacktrace 2>&1 | tee build.log
+          echo "YouTube plug-in in this build: ${{ steps.yt.outputs.present }}" | tee -a build.log
+
+      # Preview screenshots (Robolectric, ui/ShotsTest). Never blocks a release; the PNGs and the log go to the `shots` branch.
+      - name: Screenshots
+        id: shots
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          BLAZE_SHOTS=1 ./gradlew testDebugUnitTest --tests 'com.blaze.assistant.ui.ShotsTest*' --stacktrace 2>&1 | tee shots.log
+          ls -la app/build/shots
+
+      - name: Publish screenshots
+        env:
+          GH_TOKEN: ${{ github.token }}
+        if: always() && github.repository == 'lacksonkapapahue/Blaze-agent' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        run: |
+          mkdir -p /tmp/shots
+          cp app/build/shots/*.png /tmp/shots/ 2>/dev/null || true
+          { grep -E "^e: |error:|FAILURE|What went wrong" -A3 build.log 2>/dev/null | head -120; echo '----- tail -----'; tail -40 build.log 2>/dev/null; } > /tmp/shots/build.log
+          { echo "outcome: ${{ steps.shots.outcome }}  sha: ${{ github.sha }}  ref: ${{ github.head_ref || github.ref_name }}"; grep -E "^e: |FAILED|Exception|What went wrong" -A4 shots.log 2>/dev/null | head -80; echo '----- tail -----'; tail -60 shots.log 2>/dev/null; } > /tmp/shots/shots.log
+          cd /tmp/shots
+          git init -q -b shots
+          git config user.name "Blaze CI"; git config user.email "ci@users.noreply.github.com"
+          git remote add origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          git add -A && git commit -qm "Screenshots ${{ github.sha }}"
+          if ! git push origin shots --force > /tmp/push.log 2>&1; then
+            sed 's/x-access-token:[^@]*@/x-access-token:***@/g' /tmp/push.log | gh issue comment 1 --repo ${{ github.repository }} --body-file - || true
+            exit 1
+          fi
+
+      # Key rotation (v1.14.2+): v1/v2 stay on the old key for Android 8, v3 moves to the new key with a lineage
+      # for Android 9+. The old key keeps installed-data (so current installs update) but loses rollback,
+      # permission, shared-uid and auth, so an APK signed only with the old (public) key can't replace a rotated install.
+      # The new key lives only in Actions secrets; PR builds never see it.
+      - name: Rotate signing key
+        if: github.event_name != 'pull_request' && github.repository == 'lacksonkapapahue/Blaze-agent'
+        env:
+          NEW_P12: ${{ secrets.BLAZE_SIGNING_P12 }}
+          NEW_PASS: ${{ secrets.BLAZE_SIGNING_PASS }}
+        run: |
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          SIGNER="$BT/apksigner"
+          umask 077; mkdir -p "$RUNNER_TEMP/k"; K="$RUNNER_TEMP/k"
+          DRY=""
+          if [ -z "$NEW_P12" ] || [ -z "$NEW_PASS" ]; then
+            echo "::warning::BLAZE_SIGNING_P12 / BLAZE_SIGNING_PASS not set; this build stays on the old key. Dry-running the rotation with a throwaway key."
+            DRY=1; NEW_PASS=dryrunpass; export NEW_PASS
+            keytool -genkeypair -keystore "$K/new.p12" -storetype PKCS12 -alias blaze -keyalg RSA -keysize 2048 -validity 1 \
+              -dname "CN=dry" -storepass "$NEW_PASS" -keypass "$NEW_PASS" >/dev/null
+          else
+            echo "$NEW_P12" | base64 -d > "$K/new.p12"
+          fi
+          export OLD_PASS=android
+          "$SIGNER" rotate --out "$K/lineage" \
+            --old-signer --ks keystore/blaze.keystore --ks-key-alias androiddebugkey --ks-pass env:OLD_PASS --key-pass env:OLD_PASS \
+              --set-installed-data true --set-rollback false --set-permission false --set-shared-uid false --set-auth false \
+            --new-signer --ks "$K/new.p12" --ks-type PKCS12 --ks-key-alias blaze --ks-pass env:NEW_PASS --key-pass env:NEW_PASS
+          for APK in app/build/outputs/apk/release/*.apk; do
+            if [ -n "$DRY" ]; then cp "$APK" "$K/dry.apk"; APK="$K/dry.apk"; fi
+            "$SIGNER" sign --ks keystore/blaze.keystore --ks-key-alias androiddebugkey --ks-pass env:OLD_PASS --key-pass env:OLD_PASS \
+              --next-signer --ks "$K/new.p12" --ks-type PKCS12 --ks-key-alias blaze --ks-pass env:NEW_PASS --key-pass env:NEW_PASS \
+              --lineage "$K/lineage" --rotation-min-sdk-version 28 "$APK"
+            "$SIGNER" verify --print-certs -v "$APK" | grep -E "Verified using|Signer|SHA-256" | head -20
+          done
+          rm -rf "$K"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: blaze-${{ github.sha }}
+          path: app/build/outputs/apk/release/*.apk
+          retention-days: 14
+
+      - name: Publish APK to apk branch
+        if: github.event_name != 'pull_request' && github.repository == 'lacksonkapapahue/Blaze-agent' && github.ref == 'refs/heads/main'
+        run: |
+          VER=$(grep -oP 'versionName = "\K[^"]+' app/build.gradle.kts)
+          APK=$(ls app/build/outputs/apk/release/*.apk | head -1)
+          CODE=$(grep -oP 'versionCode = \K[0-9]+' app/build.gradle.kts)
+          mkdir -p /tmp/out && cp "$APK" "/tmp/out/Blaze-v$VER.apk"
+          # Bridge copy (v0.8.0 renumbered 1.x -> 0.x): older Blazes compare names and need one that sorts
+          # above 1.17.0; v0.8.0+ reads the build number from it. Same APK, same signature.
+          cp "$APK" "/tmp/out/Blaze-v1.999.$CODE.apk"
+          cd /tmp/out
+          git init -q -b apk
+          git config user.name "Blaze CI"; git config user.email "ci@users.noreply.github.com"
+          git remote add origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          echo "$VER ${{ github.sha }} $CODE" > LATEST
+          git add -A && git commit -qm "Blaze v$VER (${{ github.sha }})" && git push -q origin apk --force
+
+      - name: Publish GitHub release
+        if: github.event_name != 'pull_request' && github.repository == 'lacksonkapapahue/Blaze-agent' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VER=$(grep -oP 'versionName = "\K[^"]+' app/build.gradle.kts)
+          F="/tmp/out/Blaze-v$VER.apk"
+          NOTES=$(git log -1 --format=%s ${{ github.sha }})
+          if gh release view "v$VER" --repo ${{ github.repository }} >/dev/null 2>&1; then
+            gh release upload "v$VER" "$F" --clobber --repo ${{ github.repository }}
+          else
+            gh release create "v$VER" "$F" --repo ${{ github.repository }} --target ${{ github.sha }} --title "Blaze v$VER" --notes "$NOTES" --latest
+          fi
+
+      - name: Post failure log
+        if: failure() && github.repository == 'lacksonkapapahue/Blaze-agent' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          { echo "Steps: ${{ join(steps.*.outcome, ', ') }}"; echo "Build failed on ${{ github.sha }} (run ${{ github.run_id }})"; echo; echo '```'; grep -E "^e: |error:|FAILURE|What went wrong| FAILED$" -A6 build.log 2>/dev/null | head -160; echo '----- tail -----'; tail -80 build.log 2>/dev/null || echo "no build.log (failed before Gradle ran)"; echo '```'; } > comment.md
+          gh issue edit 1 --repo ${{ github.repository }} --body-file comment.md
+
+  # v0.30.1: the YouTube Store is an optional plug-in module (youtube/ → :youtube), kept in the private repo
+  # lacksonkapapahue/Blaze-mobile since v0.30.1. Blaze must build, pass its tests and run without it (this job never
+  # checks the plug-in out; the rm is a guard), and that APK must not contain any YouTube code.
+  build-without-youtube:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-noyt-${{ hashFiles('**/*.gradle.kts', 'gradle/wrapper/gradle-wrapper.properties') }}
+      - name: Build and test with youtube/ deleted
+        env:
+          ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+        run: |
+          rm -rf youtube
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+          chmod +x gradlew
+          set -o pipefail
+          ./gradlew testReleaseUnitTest :storeapi:test assembleRelease --stacktrace 2>&1 | tee build.log
+          APK=$(ls app/build/outputs/apk/release/*.apk | head -1)
+          ls -la "$APK"
+          mkdir -p /tmp/dex && unzip -o -q "$APK" 'classes*.dex' -d /tmp/dex
+          if grep -a -l "Lcom/blaze/assistant/mediaapps/youtube/" /tmp/dex/*.dex; then echo "::error::YouTube classes found in the no-YouTube APK"; exit 1; fi
+          echo "No YouTube code in the APK."
+
+  # The android-app-builder skill's template must keep building: make a project from it exactly as
+  # Blaze does on the phone (setup.sh), then build it like its own workflow would.
+  app-template:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Build an app from the skill template
+        env:
+          BUILD_NUMBER: '7'
+        run: |
+          sh app/src/main/assets/skills/android-app-builder/setup.sh /tmp/demo com.blaze.demo "Blaze Demo's App"
+          cd /tmp/demo
+          test -f .github/workflows/build.yml && test -f .gitignore
+          mkdir -p keystore
+          keytool -genkeypair -keystore keystore/release.jks -alias app -keyalg RSA -keysize 2048 -validity 1 -dname "CN=ci" -storepass blazeapp -keypass blazeapp
+          ./gradlew assembleRelease --stacktrace
+          ls -la app/build/outputs/apk/release/

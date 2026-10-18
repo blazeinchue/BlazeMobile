@@ -1,0 +1,77 @@
+# Blaze Gateway status
+
+- **2026-10-16, v0.3.1 (branch `gateway-nous`):** Nous Research (Nous Portal) provider `nous`
+  (migration 0004 adds the provider row + `model_tests`). Free models only (price 0 on the public
+  live `/v1/models`, which rotates); a Nous model is routed only after /admin Test replies within
+  3 s. No Nous model is in any route and no key exists yet. **Joey:** get a key at
+  portal.nousresearch.com → API keys (free plan), paste it in /admin › Providers › Nous Research ›
+  "paste a new key" › Add key, then in the card's "Free models right now" press Test on the ones you
+  want (✓ under 3 s) and add them in Routes (the picker tests again on pick).
+  - Watch: Nous's `/v1/models` JSON is ~570 KB (423 models on 2026-10-16), parsed by the cron about
+    daily like OpenRouter's list; if it hits the Workers Free CPU cap the error shows on the card.
+
+- **2026-10-15, v0.3.0 (branch `gateway-waitlist`, PR open, not merged / not deployed):** waiting
+  list (D1 `accounts` + `settings`, migration 0003, admin tab "Waiting list", 403 `waitlisted` /
+  `access_rejected`, approval on by default, admins always allowed, current users grandfathered)
+  and the plan-assignment fix (default plan now stored and shown; dropdown rebuilt every render;
+  in-card errors). App side: `Cloud.access` turns the two 403 codes into plain lines (no version
+  bump). **Deploy (Joey, needs his Cloudflare login), in this order:**
+  `cd gateway && npx wrangler login && ./scripts/ensure-d1.sh && npx wrangler d1 migrations apply blaze-gateway --remote && npm run deploy && git checkout wrangler.toml`
+  (`ensure-d1.sh` writes the real D1 id `f27cf26b-799b-418b-8298-913c7515fe7e` into wrangler.toml,
+  which holds a placeholder in git).
+  Note: merging to `main` also runs the Gateway workflow's deploy job (migrations apply + deploy)
+  when the CLOUDFLARE_API_TOKEN secret is set. After deploy: open /admin › Waiting list and check
+  the grandfathered approved list (the 4 pro emails plus usage-only accounts shown as
+  "account u_… (email not seen yet)" until their next request).
+
+- **2026-10-14, v0.2.1:** picker / naming polish after the first live discovery (gemini 29,
+  mistral 27, workers-ai 35 free chat models found via "Find models", Workers AI from the binding
+  catalogue). Next: add Groq / Cerebras / OpenRouter keys (discovery runs on add), then press
+  "Suggest best free lineup" in Routes, review, Save all.
+
+- **2026-10-14, v0.2.0 (branch `gateway-models`):** model discovery (D1 `models` / `discovery`,
+  migration 0002, cron `*/30` refreshing day-old lists), free-only rule (OpenRouter `:free`,
+  paid-only models never routed), friendly route editor with capability filters and "Suggest
+  best free lineup", Add-key re-render / in-card messages / duplicate-key guard. CI now deploys
+  from `main` (the Cloudflare secrets are set; the 2026-10-13 23:28 CAT workflow run deployed).
+  Live at `https://ai.blaze-app.workers.dev` and `https://blaze-gateway.blaze-app.workers.dev`.
+  Keys in D1: gemini, mistral (keep mistral key id 2; duplicates 3-7 were deleted by Luke).
+  - Watch: OpenRouter's `/models` JSON is ~1 MB; on the Workers Free 10 ms CPU limit its
+    discovery may hit the CPU cap once a key is added. If so, the error shows on the card and
+    the other providers are unaffected.
+  - Gemini free/paid flags are a name heuristic (Gemini 3 Pro, `-pro-preview`, deep-research
+    → paid). Re-check against ai.google.dev/pricing when Google changes tiers.
+
+- **Now:** v0.1.0 in `gateway/` of Blaze-agent (Luke's GitHub connector can't create new repos,
+  so it lives here; it has its own workflow `.github/workflows/gateway.yml`, and the Android
+  `build.yml` ignores `gateway/**`).
+- **Deployed:** 2026-10-13 (v0.1.0, Worker version 193d76d6-42ee-4ebe-87ca-cbf1634b8448), from the
+  sandbox with wrangler using a Cloudflare API token "blaze-gateway-deploy" (Workers Scripts Edit,
+  D1 Edit, Workers AI Read, Workers KV Storage Read, Account Settings Read; on the Cloudflare
+  account).
+  - URL: `https://blaze-gateway.blaze-app.workers.dev` · health `/health` → `{"ok":true,...}` ·
+    admin `/admin` (renders; HEALTH / ROUTES / PROVIDERS / PLANS).
+  - D1 `blaze-gateway` = `f27cf26b-799b-418b-8298-913c7515fe7e`, migration 0001 applied.
+  - Worker secrets set: `KEY_ENCRYPTION_SECRET`, `ADMIN_EMAILS` (the owner's Blaze account email),
+    `ADMIN_TOKEN`. KEY_ENCRYPTION_SECRET and ADMIN_TOKEN are saved in Luke's Hark vault.
+  - Workers AI (keyless) tested OK from /admin (llama-3.3-70b fp8-fast, llama-3.1-8b fast).
+    `/v1` answers 401 without a Blaze `bz_` token, as intended; an end-to-end `/v1` chat still
+    needs a Blaze session token.
+- **CI auto-deploy is still off:** the GitHub Actions secrets aren't set, so the Gateway
+  workflow's deploy job skips. If they are added later, `KEY_ENCRYPTION_SECRET` in GitHub MUST be
+  the same value as the one in the Worker (from the vault), or CI would overwrite it and saved
+  provider keys would become unreadable.
+- **Needs Luke:** add provider keys (Groq, Gemini, Cerebras, OpenRouter, Mistral) in
+  `/admin › Providers`, then test models in `/admin › Health`.
+- **Next steps (in order):**
+  1. Add keys, test every model in /admin › Health, fix model ids that 404
+     (ids follow each provider's catalogue and drift).
+  2. Android: point "Auto" at the gateway when signed in to Blaze (base URL
+     `https://blaze-gateway.blaze-app.workers.dev/v1`, key = Blaze session, send `blaze_task`
+     from `ViewRouter`). Separate PR, after the chat-UI work lands.
+  3. Desktop / CLI: same switch in the Go core.
+  4. Gateway: per-user requests/minute burst limit; geo rule for Gemini free (no EEA/UK/CH);
+     model catalogue refresh from each provider's `/models` (like Android's ProviderCatalog);
+     billing hook for standard/pro.
+- **Hard rules:** free tiers only; never log message content; never change KEY_ENCRYPTION_SECRET
+  without re-adding keys; don't touch Android signing/keystore from here.

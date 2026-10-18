@@ -1,0 +1,426 @@
+package com.blaze.assistant.home
+
+/*
+ * v0.33.2 BlazeOS Home: the pure rules. Grid sizes, which icons sit on Home and in what order, packing widgets and icons
+ * into pages, the dock, App Library search, icon shape / tint maths and the BlazeOS prefs with their one-time migration.
+ * Plain Kotlin (no Android imports), unit tested on the JVM in BlazeOsLogicTest. The Android side is BlazeOs.kt and
+ * BlazeOsApps.kt; the screen is ui/BlazeOsHome.kt.
+ */
+
+/** One icon: a real launcher activity ("app:<package>/<class>") or a built-in BlazeOS app ("blaze:<id>"). */
+data class OsApp(val id: String, val label: String, val pkg: String = "", val cls: String = "") {
+    val builtin: Boolean get() = id.startsWith(OsApps.BUILTIN)
+    /** The built-in's key ("music", "settings" …), blank for a real app. */
+    val key: String get() = if (builtin) id.removePrefix(OsApps.BUILTIN) else ""
+}
+
+object OsApps {
+    const val BUILTIN = "blaze:"
+    const val REAL = "app:"
+
+    fun realId(pkg: String, cls: String) = "$REAL$pkg/$cls"
+    fun pkgOf(id: String): String = if (id.startsWith(REAL)) id.removePrefix(REAL).substringBefore('/') else ""
+    fun clsOf(id: String): String = if (id.startsWith(REAL)) id.removePrefix(REAL).substringAfter('/', "") else ""
+
+    /** Blaze's own views as BlazeOS apps: (key, label). "settings" is the BlazeOS Settings app (the look). */
+    val builtins = listOf(
+        "chat" to "Blaze", "music" to "Music", "video" to "Video", "camera" to "Camera", "browser" to "Browser",
+        "terminal" to "Terminal", "linux" to "Desktop", "gallery" to "Gallery", "settings" to "Settings",
+    )
+
+    fun builtinApps(): List<OsApp> = builtins.map { (k, l) -> OsApp(BUILTIN + k, l) }
+
+    /** Built-ins first (their own order), then the real apps; one entry per id. */
+    fun merge(real: List<OsApp>): List<OsApp> {
+        val seen = HashSet<String>()
+        return (builtinApps() + sorted(real)).filter { seen.add(it.id) }
+    }
+
+    /** A to Z by label (case-insensitive), ties by id, so the order never jumps between reloads. */
+    fun sorted(apps: List<OsApp>): List<OsApp> = apps.sortedWith(compareBy<OsApp>({ it.label.trim().lowercase() }, { it.id }))
+
+    /** App Library search: label starts-with first, then label contains, then package contains. Blank = everything A to Z. */
+    fun search(apps: List<OsApp>, q: String): List<OsApp> {
+        val f = q.trim().lowercase()
+        if (f.isEmpty()) return sorted(apps)
+        val s = sorted(apps)
+        val starts = s.filter { it.label.lowercase().startsWith(f) || it.label.lowercase().split(' ').any { w -> w.startsWith(f) } }
+        val has = s.filter { it !in starts && it.label.lowercase().contains(f) }
+        val pkg = s.filter { it !in starts && it !in has && it.pkg.lowercase().contains(f) }
+        return starts + has + pkg
+    }
+
+    /** App Library sections by first letter ("#" for anything that isn't a letter), A to Z. */
+    fun groups(apps: List<OsApp>): List<Pair<String, List<OsApp>>> =
+        sorted(apps).groupBy { a -> a.label.trim().firstOrNull()?.takeIf { it.isLetter() }?.uppercaseChar()?.toString() ?: "#" }
+            .toList().sortedWith(compareBy({ it.first == "#" }, { it.first }))
+}
+
+/** The icon grid. */
+data class OsGrid(val cols: Int, val rows: Int) {
+    val slots: Int get() = cols * rows
+    val id: String get() = "${cols}x$rows"
+
+    companion object {
+        val options = listOf(OsGrid(4, 5), OsGrid(4, 6), OsGrid(5, 6))
+        val DEFAULT = OsGrid(4, 6)
+        fun parse(s: String?): OsGrid = options.firstOrNull { it.id == s?.trim()?.lowercase() } ?: DEFAULT
+    }
+}
+
+/** Home widgets. Half widgets are 2x2 cells (two share a row); full ones take the row. Every widget row is 2 icon rows tall. */
+object OsWidgets {
+    const val CALENDAR = "calendar"
+    const val ASK = "ask"
+    const val MUSIC = "music"
+    const val DEVICES = "devices"
+    const val BOARD = "board"
+    val all = listOf(CALENDAR, ASK, MUSIC, DEVICES, BOARD)
+    val DEFAULT = listOf(CALENDAR, ASK, MUSIC, DEVICES, BOARD)
+    const val ROW_CELLS = 2
+
+    fun half(kind: String) = kind == CALENDAR || kind == ASK
+    fun label(kind: String) = when (kind) {
+        CALENDAR -> "Calendar"; ASK -> "Ask Blaze"; MUSIC -> "Now playing"; DEVICES -> "Battery & phone"; BOARD -> "Widget stack"
+        else -> kind
+    }
+    fun describe(kind: String) = when (kind) {
+        CALENDAR -> "Today's date and your next event"
+        ASK -> "Opens a chat with Blaze"
+        MUSIC -> "Blaze Music: what's playing, with controls"
+        DEVICES -> "Battery, storage and memory rings"
+        BOARD -> "Your Home board widgets (news, weather, prices…) in one swipeable stack"
+        else -> ""
+    }
+
+    /** Known kinds only, once each, in the given order. */
+    fun norm(list: List<String>): List<String> = list.map { it.trim().lowercase() }.filter { it in all }.distinct()
+
+    /** Rows of widgets: a half widget pairs with the half right after it; otherwise it sits alone. */
+    fun rows(list: List<String>): List<List<String>> {
+        val out = ArrayList<List<String>>()
+        var i = 0
+        val l = norm(list)
+        while (i < l.size) {
+            val k = l[i]
+            if (half(k) && i + 1 < l.size && half(l[i + 1])) { out += listOf(k, l[i + 1]); i += 2 }
+            else { out += listOf(k); i++ }
+        }
+        return out
+    }
+
+    fun add(list: List<String>, kind: String): List<String> = if (kind !in all || kind in list) list else list + kind
+    fun remove(list: List<String>, kind: String): List<String> = list - kind
+}
+
+/** One Home page: its widget rows at the top, then its icons (ids) left to right, top to bottom. */
+data class OsPage(val widgetRows: List<List<String>>, val apps: List<String>) {
+    val widgetCells: Int get() = widgetRows.size * OsWidgets.ROW_CELLS
+}
+
+object OsPages {
+    /** A page with widgets keeps at least this many icon rows (as in the mockup: two widget rows, then icons). */
+    const val MIN_APP_ROWS = 2
+
+    /**
+     * Packs widget rows then icons into pages. Widgets go first, as many rows per page as leave [MIN_APP_ROWS] for icons
+     * (always at least one widget row on a page that starts with widgets); icons fill every free slot in order. Always at
+     * least one page.
+     */
+    fun pack(widgetRows: List<List<String>>, apps: List<String>, grid: OsGrid): List<OsPage> {
+        val pages = ArrayList<OsPage>()
+        var w = 0; var a = 0
+        do {
+            val here = ArrayList<List<String>>()
+            var used = 0
+            while (w < widgetRows.size && used + OsWidgets.ROW_CELLS <= grid.rows &&
+                (here.isEmpty() || used + OsWidgets.ROW_CELLS <= grid.rows - MIN_APP_ROWS)) {
+                here += widgetRows[w]; w++; used += OsWidgets.ROW_CELLS
+            }
+            val slots = (grid.rows - used).coerceAtLeast(0) * grid.cols
+            val end = minOf(apps.size, a + slots)
+            pages += OsPage(here, apps.subList(a, end).toList())
+            a = end
+        } while (w < widgetRows.size || a < apps.size)
+        return pages
+    }
+
+    /** The page index an icon is on (-1 when not on Home). */
+    fun pageOf(pages: List<OsPage>, id: String): Int = pages.indexOfFirst { id in it.apps }
+
+    /** The flat Home index of the icon at [slot] on page [page] (for drag-to-rearrange). */
+    fun flatIndex(pages: List<OsPage>, page: Int, slot: Int): Int {
+        var n = 0
+        for (i in 0 until page.coerceIn(0, pages.size)) n += pages[i].apps.size
+        val onPage = pages.getOrNull(page)?.apps?.size ?: 0
+        return n + slot.coerceIn(0, (onPage - 1).coerceAtLeast(0))
+    }
+
+    /** Where a dragged icon lands: its slot moved by whole cells, clamped to the page. */
+    fun dropSlot(slot: Int, dxCells: Int, dyCells: Int, cols: Int, count: Int): Int =
+        (slot + dxCells + dyCells * cols).coerceIn(0, (count - 1).coerceAtLeast(0))
+}
+
+/** Which icons sit on Home and in what order. */
+object OsHome {
+    /**
+     * The Home icons: the saved order minus uninstalled / removed / docked apps (once each), then every app that is new
+     * (never placed, never removed) appended. On a first run (nothing saved) that is the built-ins, then real apps A to Z.
+     */
+    fun order(saved: List<String>, all: List<OsApp>, removed: Set<String>, dock: List<String>): List<String> {
+        val ids = all.map { it.id }
+        val have = ids.toHashSet()
+        val skip = removed + dock
+        val kept = saved.filter { it in have && it !in skip }.distinct()
+        val keptSet = kept.toHashSet()
+        val fresh = ids.filter { it !in keptSet && it !in skip }
+        return kept + fresh
+    }
+
+    /** Moves [id] to position [to] in [order] (clamped). */
+    fun move(order: List<String>, id: String, to: Int): List<String> {
+        val from = order.indexOf(id)
+        if (from < 0) return order
+        val m = order.toMutableList()
+        m.removeAt(from)
+        m.add(to.coerceIn(0, m.size), id)
+        return m
+    }
+
+    /** Removes an icon from Home (it stays in the App Library). */
+    fun remove(order: List<String>, removed: Set<String>, id: String): Pair<List<String>, Set<String>> = (order - id) to (removed + id)
+
+    /** Puts an icon back on Home (from the App Library), at the end. */
+    fun restore(order: List<String>, removed: Set<String>, id: String): Pair<List<String>, Set<String>> =
+        (if (id in order) order else order + id) to (removed - id)
+}
+
+/** The dock: up to four apps, no duplicates, only installed ones. */
+object OsDock {
+    const val MAX = 4
+
+    fun normalize(saved: List<String>, installed: Set<String>): List<String> = saved.filter { it in installed }.distinct().take(MAX)
+
+    /** First run: the phone's dialer app (if found), then Blaze's Browser, Music and Camera. */
+    fun defaults(all: List<OsApp>, dialerPkg: String): List<String> {
+        val ids = all.map { it.id }.toHashSet()
+        val dialer = all.firstOrNull { !it.builtin && dialerPkg.isNotBlank() && it.pkg == dialerPkg }?.id
+        return (listOfNotNull(dialer) + listOf("blaze:browser", "blaze:music", "blaze:camera", "blaze:chat")).filter { it in ids }.distinct().take(MAX)
+    }
+
+    fun canAdd(dock: List<String>, id: String) = id !in dock && dock.size < MAX
+
+    /** In the dock → out; out and there's room → in; full → unchanged. */
+    fun toggle(dock: List<String>, id: String): List<String> = when {
+        id in dock -> dock - id
+        dock.size < MAX -> dock + id
+        else -> dock
+    }
+
+    fun move(dock: List<String>, id: String, by: Int): List<String> {
+        val i = dock.indexOf(id); if (i < 0) return dock
+        val j = (i + by).coerceIn(0, dock.size - 1); if (i == j) return dock
+        val m = dock.toMutableList(); m.removeAt(i); m.add(j, id); return m
+    }
+}
+
+/** Icon shapes, tints and sizes. */
+object OsIcons {
+    const val SQUIRCLE = "squircle"
+    const val CIRCLE = "circle"
+    const val ROUNDED = "rounded"
+    val shapes = listOf(SQUIRCLE, CIRCLE, ROUNDED)
+    fun normShape(s: String?): String = s?.trim()?.lowercase()?.takeIf { it in shapes } ?: SQUIRCLE
+
+    /** Largest icon bitmap kept (px): plenty for a 60 dp icon on an xhdpi A12, small enough for its RAM. */
+    const val MAX_PX = 144
+
+    /** Bitmap size for an icon of [dp] at [density], capped at [MAX_PX] (never below 24). */
+    fun sizePx(dp: Float, density: Float, cap: Int = MAX_PX): Int = (dp * density).toInt().coerceIn(24, cap)
+
+    /**
+     * Outline of a superellipse |x|^n + |y|^n = 1 (n = 5 is close to iOS's squircle) as [points] (x, y) pairs in a unit
+     * box (0..1). Starts at the right middle and goes round once.
+     */
+    fun squircle(points: Int = 72, n: Double = 5.0): List<Pair<Float, Float>> = (0 until points).map { i ->
+        val t = 2.0 * Math.PI * i / points
+        val c = Math.cos(t); val s = Math.sin(t)
+        val x = Math.signum(c) * Math.pow(Math.abs(c), 2.0 / n)
+        val y = Math.signum(s) * Math.pow(Math.abs(s), 2.0 / n)
+        ((x * 0.5 + 0.5).toFloat()) to ((y * 0.5 + 0.5).toFloat())
+    }
+
+    /**
+     * A 4x5 colour matrix (row-major, 20 floats, the layout Android and Compose use): the icon in greys by luminance,
+     * multiplied by the tint (r, g, b in 0..1), blended with the original by [strength] (0 = untouched, 1 = fully
+     * tinted). Alpha untouched.
+     */
+    fun tintMatrix(r: Float, g: Float, b: Float, strength: Float = 0.85f): FloatArray {
+        val s = strength.coerceIn(0f, 1f)
+        val lr = 0.2126f; val lg = 0.7152f; val lb = 0.0722f
+        // Lift the tint a little so dark icons don't go black.
+        val k = 1.15f
+        fun row(t: Float, self: Int): FloatArray {
+            val out = floatArrayOf(s * lr * t * k, s * lg * t * k, s * lb * t * k, 0f, 0f)
+            out[self] += 1f - s
+            return out
+        }
+        return row(r, 0) + row(g, 1) + row(b, 2) + floatArrayOf(0f, 0f, 0f, 1f, 0f)
+    }
+
+    /** "#RRGGBB" / "RRGGBB" → 0xFFRRGGBB, or null. */
+    fun parseColor(s: String?): Long? {
+        val t = s?.trim()?.removePrefix("#") ?: return null
+        if (t.length != 6 || t.any { it.lowercaseChar() !in "0123456789abcdef" }) return null
+        return 0xFF000000L or t.toLong(16)
+    }
+
+    fun hex(argb: Long): String = "#" + (argb and 0xFFFFFFL).toString(16).padStart(6, '0').uppercase()
+}
+
+/** Wallpaper values: "preset:<id>", "photo" or "solid:#RRGGBB". */
+object OsWallpaper {
+    val presets = listOf("dusk" to "Blaze dusk", "ocean" to "Ocean", "ember" to "Ember", "graphite" to "Graphite")
+    const val DEFAULT = "preset:dusk"
+    val solids = listOf("#14161C", "#1F2A44", "#2B1F3A", "#203A2E", "#3A2418", "#E9E4DC")
+
+    fun norm(v: String?): String {
+        val t = v?.trim().orEmpty()
+        return when {
+            t == "photo" -> t
+            t.startsWith("preset:") && presets.any { it.first == t.removePrefix("preset:") } -> t
+            t.startsWith("solid:") && OsIcons.parseColor(t.removePrefix("solid:")) != null -> "solid:" + OsIcons.hex(OsIcons.parseColor(t.removePrefix("solid:"))!!)
+            else -> DEFAULT
+        }
+    }
+    fun preset(v: String): String = if (v.startsWith("preset:")) v.removePrefix("preset:") else ""
+}
+
+/**
+ * Everything the BlazeOS Settings app changes. Stored as new string prefs `bos_*` only (nothing old is changed or
+ * renamed), so older builds simply ignore them and the Classic board keeps working.
+ */
+data class OsPrefs(
+    val classic: Boolean = false,
+    val wallpaper: String = OsWallpaper.DEFAULT,
+    val iconShape: String = OsIcons.SQUIRCLE,
+    /** "" = the apps' own colours, else "#RRGGBB". */
+    val iconTint: String = "",
+    val grid: OsGrid = OsGrid.DEFAULT,
+    val labels: Boolean = true,
+    val dockOn: Boolean = true,
+    /** null = never set (use [OsDock.defaults]); empty = the user emptied it. */
+    val dock: List<String>? = null,
+    /** low | medium | high. */
+    val glass: String = "medium",
+    /** "" = Blaze's own warm accent, else "#RRGGBB". */
+    val accent: String = "",
+    /** dark | light. */
+    val theme: String = "dark",
+    /** s | m | l. */
+    val font: String = "m",
+    val order: List<String> = emptyList(),
+    val removed: Set<String> = emptySet(),
+    val widgets: List<String> = OsWidgets.DEFAULT,
+    /** The user turned on "Use BlazeOS as the phone's launcher" (the HOME alias is enabled). */
+    val launcher: Boolean = false,
+) {
+    val fontScale: Float get() = when (font) { "s" -> 0.9f; "l" -> 1.15f; else -> 1f }
+    val dark: Boolean get() = theme != "light"
+
+    companion object {
+        const val VERSION = 1
+        const val K_VERSION = "bos_v"
+        const val K_CLASSIC = "bos_classic"
+        const val K_WALL = "bos_wallpaper"
+        const val K_SHAPE = "bos_icon_shape"
+        const val K_TINT = "bos_icon_tint"
+        const val K_GRID = "bos_grid"
+        const val K_LABELS = "bos_labels"
+        const val K_DOCK_ON = "bos_dock_on"
+        const val K_DOCK = "bos_dock"
+        const val K_GLASS = "bos_glass"
+        const val K_ACCENT = "bos_accent"
+        const val K_THEME = "bos_theme"
+        const val K_FONT = "bos_font"
+        const val K_ORDER = "bos_order"
+        const val K_REMOVED = "bos_removed"
+        const val K_WIDGETS = "bos_widgets"
+        const val K_LAUNCHER = "bos_launcher"
+        /** Written for an emptied dock (an empty string reads as "never set"). */
+        const val EMPTY = "-"
+
+        val glassLevels = listOf("low", "medium", "high")
+        val fonts = listOf("s", "m", "l")
+        val accents = listOf("" to "Blaze", "#FF9A3C" to "Orange", "#4DA3FF" to "Blue", "#69DB7C" to "Green", "#B197FC" to "Purple", "#F783AC" to "Pink", "#66D9E8" to "Teal")
+        val tints = listOf("" to "Off", "#4DA3FF" to "Blue", "#FF9A3C" to "Orange", "#69DB7C" to "Green", "#B197FC" to "Purple", "#E6E6EA" to "Mono")
+
+        private fun list(s: String?): List<String> = s.orEmpty().split('\n').map { it.trim() }.filter { it.isNotEmpty() && it != EMPTY }
+        private fun bool(s: String?, def: Boolean): Boolean = when (s?.trim()) { "1", "true" -> true; "0", "false" -> false; else -> def }
+        private fun color(s: String?): String = OsIcons.parseColor(s)?.let { OsIcons.hex(it) } ?: ""
+
+        /** Reads (and normalises) the prefs; a missing or unknown value falls back to its default. */
+        fun read(get: (String) -> String?): OsPrefs {
+            val dockRaw = get(K_DOCK)
+            val widgetsRaw = get(K_WIDGETS)
+            return OsPrefs(
+                classic = bool(get(K_CLASSIC), false),
+                wallpaper = OsWallpaper.norm(get(K_WALL)),
+                iconShape = OsIcons.normShape(get(K_SHAPE)),
+                iconTint = color(get(K_TINT)),
+                grid = OsGrid.parse(get(K_GRID)),
+                labels = bool(get(K_LABELS), true),
+                dockOn = bool(get(K_DOCK_ON), true),
+                dock = if (dockRaw.isNullOrEmpty()) null else list(dockRaw).distinct().take(OsDock.MAX),
+                glass = get(K_GLASS)?.trim()?.lowercase()?.takeIf { it in glassLevels } ?: "medium",
+                accent = color(get(K_ACCENT)),
+                theme = if (get(K_THEME)?.trim() == "light") "light" else "dark",
+                font = get(K_FONT)?.trim()?.lowercase()?.takeIf { it in fonts } ?: "m",
+                order = list(get(K_ORDER)).distinct(),
+                removed = list(get(K_REMOVED)).toSet(),
+                widgets = if (widgetsRaw.isNullOrEmpty()) OsWidgets.DEFAULT else OsWidgets.norm(list(widgetsRaw)),
+                launcher = bool(get(K_LAUNCHER), false),
+            )
+        }
+
+        /** Every key with its stored text (the reverse of [read]). */
+        fun write(p: OsPrefs): Map<String, String> = linkedMapOf(
+            K_VERSION to VERSION.toString(),
+            K_CLASSIC to if (p.classic) "1" else "0",
+            K_WALL to OsWallpaper.norm(p.wallpaper),
+            K_SHAPE to OsIcons.normShape(p.iconShape),
+            K_TINT to color(p.iconTint),
+            K_GRID to p.grid.id,
+            K_LABELS to if (p.labels) "1" else "0",
+            K_DOCK_ON to if (p.dockOn) "1" else "0",
+            K_DOCK to (p.dock?.let { if (it.isEmpty()) EMPTY else it.joinToString("\n") } ?: ""),
+            K_GLASS to p.glass,
+            K_ACCENT to color(p.accent),
+            K_THEME to p.theme,
+            K_FONT to p.font,
+            K_ORDER to p.order.joinToString("\n"),
+            K_REMOVED to p.removed.joinToString("\n"),
+            K_WIDGETS to (OsWidgets.norm(p.widgets).joinToString("\n").ifEmpty { EMPTY }),
+            K_LAUNCHER to if (p.launcher) "1" else "0",
+        )
+
+        /** The old Home board's accent names (HomeLook.accents, dark values) as BlazeOS accents. */
+        private val legacyAccents = mapOf("orange" to "#FF9A3C", "green" to "#69DB7C", "purple" to "#B197FC", "pink" to "#F783AC", "teal" to "#66D9E8")
+
+        /**
+         * One-time migration from before BlazeOS (no `bos_v` yet): the keys to write. A Home board photo background
+         * becomes the photo wallpaper (the same file is read), the board accent carries over, and the app's light theme
+         * gives BlazeOS's light look. Nothing old is touched. Empty when already migrated.
+         */
+        fun migrate(get: (String) -> String?): Map<String, String> {
+            val v = get(K_VERSION)?.trim()?.toIntOrNull()
+            if (v != null && v >= VERSION) return emptyMap()
+            val out = LinkedHashMap<String, String>()
+            if (get(K_WALL).isNullOrBlank() && get("home_bg")?.trim() == "image") out[K_WALL] = "photo"
+            if (get(K_ACCENT).isNullOrBlank()) legacyAccents[get("home_accent")?.trim().orEmpty()]?.let { out[K_ACCENT] = it }
+            if (get(K_THEME).isNullOrBlank() && get("theme_mode")?.trim() == "light") out[K_THEME] = "light"
+            out[K_VERSION] = VERSION.toString()
+            return out
+        }
+    }
+}

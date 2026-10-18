@@ -1,4 +1,4 @@
-package com.blaze.assistant.home
+package com.blaze.assistant.blazeos
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -6,9 +6,9 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
-/** v0.33.2 BlazeOS Home: grid layout, page packing, Home order, the dock, icon maths and prefs migration. */
-class BlazeOsLogicTest {
-    private fun real(n: Int) = (1..n).map { OsApp(OsApps.realId("com.example.app$it", "com.example.app$it.Main"), "App $it", "com.example.app$it", "com.example.app$it.Main") }
+/** v0.33.2 BlazeOS: grid layout, page packing, Home order, the dock, icon maths and prefs migration. */
+class OsLayoutTest {
+    private fun inst(n: Int) = (1..n).map { OsApp(OsApps.pkgId("com.example.app$it"), "App $it", OsManifest.WEB, removable = true) }
     private fun ids(n: Int, p: String = "a") = (1..n).map { "$p$it" }
 
     // ---------------- grid ----------------
@@ -23,7 +23,9 @@ class BlazeOsLogicTest {
     }
 
     @Test fun widgetRowsPairHalvesAndKeepFullsAlone() {
-        assertEquals(listOf(listOf("calendar", "ask"), listOf("music"), listOf("devices"), listOf("board")), OsWidgets.rows(OsWidgets.DEFAULT))
+        assertEquals(listOf(listOf("calendar", "ask"), listOf("music"), listOf("battery")), OsWidgets.rows(OsWidgets.DEFAULT))
+        // The first drafts' "devices" widget reads as battery.
+        assertEquals(listOf("battery"), OsWidgets.norm(listOf("devices", "battery")))
         // A half followed by a full sits alone.
         assertEquals(listOf(listOf("ask"), listOf("music"), listOf("calendar")), OsWidgets.rows(listOf("ask", "music", "calendar")))
         // Unknown kinds and repeats are dropped.
@@ -37,22 +39,21 @@ class BlazeOsLogicTest {
         // Page 1: calendar + ask, music, then 2 rows of 4 icons (like the mockup).
         assertEquals(listOf(listOf("calendar", "ask"), listOf("music")), pages[0].widgetRows)
         assertEquals(ids(8), pages[0].apps)
-        // Page 2: devices, board, 8 more icons.
-        assertEquals(listOf(listOf("devices"), listOf("board")), pages[1].widgetRows)
-        assertEquals((9..16).map { "a$it" }, pages[1].apps)
-        // Page 3: a full page of icons, then the rest.
-        assertEquals(24, pages[2].apps.size)
-        assertEquals(listOf("a41"), pages[3].apps)
-        assertEquals(4, pages.size)
+        // Page 2: battery, then 16 more icons.
+        assertEquals(listOf(listOf("battery")), pages[1].widgetRows)
+        assertEquals((9..24).map { "a$it" }, pages[1].apps)
+        // Page 3: the rest.
+        assertEquals((25..41).map { "a$it" }, pages[2].apps)
+        assertEquals(3, pages.size)
         assertEquals(41, pages.sumOf { it.apps.size })
     }
 
     @Test fun smallGridKeepsOneWidgetRowAPage() {
         val pages = OsPages.pack(OsWidgets.rows(OsWidgets.DEFAULT), ids(5), OsGrid(4, 5))
-        assertTrue(pages.take(4).all { it.widgetRows.size == 1 })
+        assertTrue(pages.take(3).all { it.widgetRows.size == 1 })
         assertEquals(5, pages[0].apps.size)
         assertEquals(5, pages.sumOf { it.apps.size })
-        assertEquals(4, pages.count { it.widgetRows.isNotEmpty() })
+        assertEquals(3, pages.count { it.widgetRows.isNotEmpty() })
     }
 
     @Test fun noWidgetsAndNoAppsStillGivesOnePage() {
@@ -76,6 +77,8 @@ class BlazeOsLogicTest {
         assertEquals(1, OsPages.pageOf(pages, "a9"))
         assertEquals(-1, OsPages.pageOf(pages, "zz"))
         assertEquals(8 + 2, OsPages.flatIndex(pages, 1, 2))
+        assertEquals(1, OsPages.pageOf(pages, "a24"))
+        assertEquals(2, OsPages.pageOf(pages, "a25"))
         // One cell right, one row down on a 4-wide grid.
         assertEquals(6, OsPages.dropSlot(1, 1, 1, 4, 8))
         assertEquals(7, OsPages.dropSlot(6, 3, 3, 4, 8))
@@ -85,22 +88,29 @@ class BlazeOsLogicTest {
     // ---------------- Home order ----------------
 
     @Test fun homeOrderDropsUninstalledRemovedAndDockedThenAppendsNewApps() {
-        val all = OsApps.merge(real(3))
-        val a1 = real(3)[0].id; val a2 = real(3)[1].id; val a3 = real(3)[2].id
-        val saved = listOf(a2, "app:gone/x", a1, a2, "blaze:music")
+        val all = OsApps.merge(inst(3))
+        val a1 = inst(3)[0].id; val a2 = inst(3)[1].id; val a3 = inst(3)[2].id
+        val saved = listOf(a2, "pkg:gone", a1, a2, "blaze:music")
         val o = OsHome.order(saved, all, removed = setOf("blaze:video"), dock = listOf("blaze:browser"))
         assertEquals(listOf(a2, a1, "blaze:music"), o.take(3))
-        assertFalse("app:gone/x" in o)
+        assertFalse("pkg:gone" in o)
         assertFalse("blaze:video" in o)
         assertFalse("blaze:browser" in o)
         assertTrue(a3 in o)
         assertEquals(o.distinct(), o)
     }
 
-    @Test fun firstRunIsBuiltinsThenRealAppsAToZ() {
-        val all = OsApps.merge(listOf(OsApp("app:z/Z", "Zed", "z"), OsApp("app:b/B", "bravo", "b")))
+    @Test fun firstRunIsBuiltinsThenInstalledAppsAToZ() {
+        val all = OsApps.merge(listOf(OsApp("pkg:z", "Zed", OsManifest.WEB), OsApp("pkg:b", "bravo", OsManifest.LINUX)))
         val o = OsHome.order(emptyList(), all, emptySet(), emptyList())
-        assertEquals(OsApps.builtinApps().map { it.id } + listOf("app:b/B", "app:z/Z"), o)
+        assertEquals(OsApps.builtinApps().map { it.id } + listOf("pkg:b", "pkg:z"), o)
+        // Every built-in the brief lists is there, once, and only BlazeOS's own apps (never the host phone's).
+        assertEquals(14, OsApps.builtins.size)
+        assertTrue(listOf("blaze", "camera", "photos", "music", "video", "browser", "calendar", "clock", "weather", "files", "terminal", "linux", "store", "settings")
+            .all { it in OsApps.builtinKeys })
+        assertTrue(all.all { it.id.startsWith(OsApps.BUILTIN) || it.id.startsWith(OsApps.PKG) })
+        assertEquals("z", all.first { it.id == "pkg:z" }.key)
+        assertEquals("music", OsApp("blaze:music", "Music").key)
     }
 
     @Test fun moveRemoveRestore() {
@@ -117,11 +127,10 @@ class BlazeOsLogicTest {
     // ---------------- dock ----------------
 
     @Test fun dockRules() {
-        val all = OsApps.merge(listOf(OsApp("app:com.dialer/Main", "Phone", "com.dialer")))
-        assertEquals(listOf("app:com.dialer/Main", "blaze:browser", "blaze:music", "blaze:camera"), OsDock.defaults(all, "com.dialer"))
-        assertEquals(listOf("blaze:browser", "blaze:music", "blaze:camera", "blaze:chat"), OsDock.defaults(all, ""))
+        val all = OsApps.merge(emptyList())
+        assertEquals(listOf("blaze:blaze", "blaze:browser", "blaze:music", "blaze:camera"), OsDock.defaults(all))
         val installed = all.map { it.id }.toSet()
-        assertEquals(listOf("blaze:music", "blaze:chat"), OsDock.normalize(listOf("blaze:music", "app:gone/x", "blaze:music", "blaze:chat"), installed))
+        assertEquals(listOf("blaze:music", "blaze:blaze"), OsDock.normalize(listOf("blaze:music", "pkg:gone", "blaze:music", "blaze:blaze"), installed))
         assertEquals(4, OsDock.normalize(OsApps.builtinApps().map { it.id }, installed).size)
         val full = listOf("a", "b", "c", "d")
         assertFalse(OsDock.canAdd(full, "e"))
@@ -135,12 +144,12 @@ class BlazeOsLogicTest {
     // ---------------- search / library ----------------
 
     @Test fun searchPrefersLabelStarts() {
-        val apps = listOf(OsApp("1", "Messages", "com.msg"), OsApp("2", "Google Maps", "com.google.maps"), OsApp("3", "Gmail", "com.google.gm"), OsApp("4", "Camera", "com.cam"))
-        assertEquals(listOf("3", "2"), OsApps.search(apps, "g").map { it.id }.take(2))
-        assertEquals(listOf("2"), OsApps.search(apps, "maps").map { it.id })
-        assertEquals(listOf("2", "3"), OsApps.search(apps, "google").map { it.id })
+        val apps = listOf(OsApp("pkg:com.msg", "Messages"), OsApp("pkg:com.google.maps", "Google Maps"), OsApp("pkg:com.google.gm", "Gmail"), OsApp("pkg:com.cam", "Camera"))
+        assertEquals(listOf("pkg:com.google.gm", "pkg:com.google.maps"), OsApps.search(apps, "g").map { it.id }.take(2))
+        assertEquals(listOf("pkg:com.google.maps"), OsApps.search(apps, "maps").map { it.id })
+        assertEquals(listOf("pkg:com.google.maps", "pkg:com.google.gm"), OsApps.search(apps, "google").map { it.id })
         assertEquals(4, OsApps.search(apps, " ").size)
-        val g = OsApps.groups(apps + OsApp("5", "1Password", "p"))
+        val g = OsApps.groups(apps + OsApp("pkg:p", "1Password"))
         assertEquals(listOf("C", "G", "M", "#"), g.map { it.first })
     }
 
@@ -181,7 +190,8 @@ class BlazeOsLogicTest {
     @Test fun prefsRoundTrip() {
         val p = OsPrefs(classic = true, wallpaper = "solid:#1f2a44", iconShape = "circle", iconTint = "#4da3ff", grid = OsGrid(5, 6), labels = false,
             dockOn = false, dock = listOf("blaze:music", "blaze:camera"), glass = "high", accent = "#69DB7C", theme = "light", font = "l",
-            order = listOf("blaze:chat", "app:a/A"), removed = setOf("blaze:video"), widgets = listOf("music", "ask"), launcher = true)
+            order = listOf("blaze:blaze", "pkg:a"), removed = setOf("blaze:video"), widgets = listOf("music", "ask"),
+            volume = 35, brightness = 80, lastApp = "blaze:clock")
         val m = OsPrefs.write(p)
         val back = OsPrefs.read { m[it] }
         assertEquals(p.copy(wallpaper = "solid:#1F2A44", iconTint = "#4DA3FF"), back)
@@ -207,6 +217,9 @@ class BlazeOsLogicTest {
         assertEquals("", p.iconTint)
         assertTrue(p.labels)
         assertEquals(listOf("music"), p.widgets)
+        // Brightness never reads below the floor; volume and brightness clamp to 0..100.
+        assertEquals(OsPrefs.MIN_BRIGHTNESS, OsPrefs.read { mapOf(OsPrefs.K_BRIGHTNESS to "0")[it] }.brightness)
+        assertEquals(100, OsPrefs.read { mapOf(OsPrefs.K_VOLUME to "250")[it] }.volume)
         // Nothing stored at all = all defaults (dock never set, widgets = the default set).
         assertEquals(OsPrefs(), OsPrefs.read { null })
         assertNull(OsPrefs().dock)

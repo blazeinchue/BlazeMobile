@@ -1,53 +1,57 @@
-package com.blaze.assistant.home
+package com.blaze.assistant.blazeos
 
 /*
- * v0.33.2 BlazeOS Home: the pure rules. Grid sizes, which icons sit on Home and in what order, packing widgets and icons
- * into pages, the dock, App Library search, icon shape / tint maths and the BlazeOS prefs with their one-time migration.
- * Plain Kotlin (no Android imports), unit tested on the JVM in BlazeOsLogicTest. The Android side is BlazeOs.kt and
- * BlazeOsApps.kt; the screen is ui/BlazeOsHome.kt.
+ * v0.33.2 BlazeOS: the pure layout rules. Grid sizes, which icons sit on the BlazeOS home screen and in what order,
+ * packing widgets and icons into pages, the dock, App Library search, icon shape / tint maths and the BlazeOS prefs
+ * with their one-time migration. Plain Kotlin (no Android imports), unit tested on the JVM in OsLayoutTest.
+ * BlazeOS is Blaze's own virtual phone: every icon is a BlazeOS app (a built-in or one installed from its App Store),
+ * never an app of the host phone.
  */
 
-/** One icon: a real launcher activity ("app:<package>/<class>") or a built-in BlazeOS app ("blaze:<id>"). */
-data class OsApp(val id: String, val label: String, val pkg: String = "", val cls: String = "") {
+/**
+ * One icon: a built-in BlazeOS app ("blaze:<key>") or one installed from the BlazeOS App Store ("pkg:<manifest id>").
+ * [kind] is the entry type: builtin, web or linux.
+ */
+data class OsApp(val id: String, val label: String, val kind: String = OsManifest.BUILTIN, val removable: Boolean = false) {
     val builtin: Boolean get() = id.startsWith(OsApps.BUILTIN)
-    /** The built-in's key ("music", "settings" …), blank for a real app. */
-    val key: String get() = if (builtin) id.removePrefix(OsApps.BUILTIN) else ""
+    /** The built-in's key ("music", "settings" …), or the installed app's manifest id. */
+    val key: String get() = if (builtin) id.removePrefix(OsApps.BUILTIN) else id.removePrefix(OsApps.PKG)
 }
 
 object OsApps {
     const val BUILTIN = "blaze:"
-    const val REAL = "app:"
+    const val PKG = "pkg:"
 
-    fun realId(pkg: String, cls: String) = "$REAL$pkg/$cls"
-    fun pkgOf(id: String): String = if (id.startsWith(REAL)) id.removePrefix(REAL).substringBefore('/') else ""
-    fun clsOf(id: String): String = if (id.startsWith(REAL)) id.removePrefix(REAL).substringAfter('/', "") else ""
+    fun pkgId(manifestId: String) = "$PKG$manifestId"
 
-    /** Blaze's own views as BlazeOS apps: (key, label). "settings" is the BlazeOS Settings app (the look). */
+    /** The built-in apps, in their first-run order: (key, label). */
     val builtins = listOf(
-        "chat" to "Blaze", "music" to "Music", "video" to "Video", "camera" to "Camera", "browser" to "Browser",
-        "terminal" to "Terminal", "linux" to "Desktop", "gallery" to "Gallery", "settings" to "Settings",
+        "blaze" to "Blaze", "camera" to "Camera", "photos" to "Photos", "music" to "Music", "video" to "Video",
+        "browser" to "Browser", "calendar" to "Calendar", "clock" to "Clock", "weather" to "Weather", "files" to "Files",
+        "terminal" to "Terminal", "linux" to "Desktop", "store" to "App Store", "settings" to "Settings",
     )
+    val builtinKeys: Set<String> = builtins.map { it.first }.toHashSet()
 
     fun builtinApps(): List<OsApp> = builtins.map { (k, l) -> OsApp(BUILTIN + k, l) }
 
-    /** Built-ins first (their own order), then the real apps; one entry per id. */
-    fun merge(real: List<OsApp>): List<OsApp> {
+    /** Built-ins first (their own order), then installed apps A to Z; one entry per id. */
+    fun merge(installed: List<OsApp>): List<OsApp> {
         val seen = HashSet<String>()
-        return (builtinApps() + sorted(real)).filter { seen.add(it.id) }
+        return (builtinApps() + sorted(installed)).filter { seen.add(it.id) }
     }
 
     /** A to Z by label (case-insensitive), ties by id, so the order never jumps between reloads. */
     fun sorted(apps: List<OsApp>): List<OsApp> = apps.sortedWith(compareBy<OsApp>({ it.label.trim().lowercase() }, { it.id }))
 
-    /** App Library search: label starts-with first, then label contains, then package contains. Blank = everything A to Z. */
+    /** App Library search: label (or a word of it) starts with the query first, then label contains, then id contains. */
     fun search(apps: List<OsApp>, q: String): List<OsApp> {
         val f = q.trim().lowercase()
         if (f.isEmpty()) return sorted(apps)
         val s = sorted(apps)
         val starts = s.filter { it.label.lowercase().startsWith(f) || it.label.lowercase().split(' ').any { w -> w.startsWith(f) } }
         val has = s.filter { it !in starts && it.label.lowercase().contains(f) }
-        val pkg = s.filter { it !in starts && it !in has && it.pkg.lowercase().contains(f) }
-        return starts + has + pkg
+        val ids = s.filter { it !in starts && it !in has && it.key.lowercase().contains(f) }
+        return starts + has + ids
     }
 
     /** App Library sections by first letter ("#" for anything that isn't a letter), A to Z. */
@@ -73,28 +77,28 @@ object OsWidgets {
     const val CALENDAR = "calendar"
     const val ASK = "ask"
     const val MUSIC = "music"
-    const val DEVICES = "devices"
-    const val BOARD = "board"
-    val all = listOf(CALENDAR, ASK, MUSIC, DEVICES, BOARD)
-    val DEFAULT = listOf(CALENDAR, ASK, MUSIC, DEVICES, BOARD)
+    const val BATTERY = "battery"
+    val all = listOf(CALENDAR, ASK, MUSIC, BATTERY)
+    val DEFAULT = listOf(CALENDAR, ASK, MUSIC, BATTERY)
+    /** Names used by the first BlazeOS drafts, read as today's kinds. */
+    private val aliases = mapOf("devices" to BATTERY)
     const val ROW_CELLS = 2
 
     fun half(kind: String) = kind == CALENDAR || kind == ASK
     fun label(kind: String) = when (kind) {
-        CALENDAR -> "Calendar"; ASK -> "Ask Blaze"; MUSIC -> "Now playing"; DEVICES -> "Battery & phone"; BOARD -> "Widget stack"
+        CALENDAR -> "Calendar"; ASK -> "Ask Blaze"; MUSIC -> "Now playing"; BATTERY -> "Battery"
         else -> kind
     }
     fun describe(kind: String) = when (kind) {
-        CALENDAR -> "Today's date and your next event"
-        ASK -> "Opens a chat with Blaze"
-        MUSIC -> "Blaze Music: what's playing, with controls"
-        DEVICES -> "Battery, storage and memory rings"
-        BOARD -> "Your Home board widgets (news, weather, prices…) in one swipeable stack"
+        CALENDAR -> "Today's date and the next event in BlazeOS Calendar"
+        ASK -> "Opens the Blaze assistant app"
+        MUSIC -> "What's playing, with controls"
+        BATTERY -> "Battery, BlazeOS disk and memory rings"
         else -> ""
     }
 
     /** Known kinds only, once each, in the given order. */
-    fun norm(list: List<String>): List<String> = list.map { it.trim().lowercase() }.filter { it in all }.distinct()
+    fun norm(list: List<String>): List<String> = list.map { it.trim().lowercase() }.map { aliases[it] ?: it }.filter { it in all }.distinct()
 
     /** Rows of widgets: a half widget pairs with the half right after it; otherwise it sits alone. */
     fun rows(list: List<String>): List<List<String>> {
@@ -165,7 +169,7 @@ object OsPages {
 object OsHome {
     /**
      * The Home icons: the saved order minus uninstalled / removed / docked apps (once each), then every app that is new
-     * (never placed, never removed) appended. On a first run (nothing saved) that is the built-ins, then real apps A to Z.
+     * (never placed, never removed) appended. On a first run (nothing saved) that is the built-ins, then installed apps A to Z.
      */
     fun order(saved: List<String>, all: List<OsApp>, removed: Set<String>, dock: List<String>): List<String> {
         val ids = all.map { it.id }
@@ -198,14 +202,14 @@ object OsHome {
 /** The dock: up to four apps, no duplicates, only installed ones. */
 object OsDock {
     const val MAX = 4
+    /** First run, as in design B: Blaze, Browser, Music, Camera. */
+    val DEFAULT = listOf("blaze:blaze", "blaze:browser", "blaze:music", "blaze:camera")
 
     fun normalize(saved: List<String>, installed: Set<String>): List<String> = saved.filter { it in installed }.distinct().take(MAX)
 
-    /** First run: the phone's dialer app (if found), then Blaze's Browser, Music and Camera. */
-    fun defaults(all: List<OsApp>, dialerPkg: String): List<String> {
+    fun defaults(all: List<OsApp>): List<String> {
         val ids = all.map { it.id }.toHashSet()
-        val dialer = all.firstOrNull { !it.builtin && dialerPkg.isNotBlank() && it.pkg == dialerPkg }?.id
-        return (listOfNotNull(dialer) + listOf("blaze:browser", "blaze:music", "blaze:camera", "blaze:chat")).filter { it in ids }.distinct().take(MAX)
+        return DEFAULT.filter { it in ids }
     }
 
     fun canAdd(dock: List<String>, id: String) = id !in dock && dock.size < MAX
@@ -322,8 +326,11 @@ data class OsPrefs(
     val order: List<String> = emptyList(),
     val removed: Set<String> = emptySet(),
     val widgets: List<String> = OsWidgets.DEFAULT,
-    /** The user turned on "Use BlazeOS as the phone's launcher" (the HOME alias is enabled). */
-    val launcher: Boolean = false,
+    /** BlazeOS's own volume and brightness, 0..100 (never the host phone's). */
+    val volume: Int = 60,
+    val brightness: Int = 100,
+    /** The app open when BlazeOS last paused ("" = the home screen), restored on resume. */
+    val lastApp: String = "",
 ) {
     val fontScale: Float get() = when (font) { "s" -> 0.9f; "l" -> 1.15f; else -> 1f }
     val dark: Boolean get() = theme != "light"
@@ -346,7 +353,9 @@ data class OsPrefs(
         const val K_ORDER = "bos_order"
         const val K_REMOVED = "bos_removed"
         const val K_WIDGETS = "bos_widgets"
-        const val K_LAUNCHER = "bos_launcher"
+        const val K_VOLUME = "bos_volume"
+        const val K_BRIGHTNESS = "bos_brightness"
+        const val K_LAST_APP = "bos_last_app"
         /** Written for an emptied dock (an empty string reads as "never set"). */
         const val EMPTY = "-"
 
@@ -357,6 +366,9 @@ data class OsPrefs(
 
         private fun list(s: String?): List<String> = s.orEmpty().split('\n').map { it.trim() }.filter { it.isNotEmpty() && it != EMPTY }
         private fun bool(s: String?, def: Boolean): Boolean = when (s?.trim()) { "1", "true" -> true; "0", "false" -> false; else -> def }
+        /** BlazeOS never dims below this, so the screen can't go black by accident. */
+        const val MIN_BRIGHTNESS = 15
+        private fun pct(s: String?, def: Int): Int = s?.trim()?.toIntOrNull()?.coerceIn(0, 100) ?: def
         private fun color(s: String?): String = OsIcons.parseColor(s)?.let { OsIcons.hex(it) } ?: ""
 
         /** Reads (and normalises) the prefs; a missing or unknown value falls back to its default. */
@@ -379,7 +391,9 @@ data class OsPrefs(
                 order = list(get(K_ORDER)).distinct(),
                 removed = list(get(K_REMOVED)).toSet(),
                 widgets = if (widgetsRaw.isNullOrEmpty()) OsWidgets.DEFAULT else OsWidgets.norm(list(widgetsRaw)),
-                launcher = bool(get(K_LAUNCHER), false),
+                volume = pct(get(K_VOLUME), 60),
+                brightness = pct(get(K_BRIGHTNESS), 100).coerceAtLeast(MIN_BRIGHTNESS),
+                lastApp = get(K_LAST_APP)?.trim().orEmpty(),
             )
         }
 
@@ -401,7 +415,9 @@ data class OsPrefs(
             K_ORDER to p.order.joinToString("\n"),
             K_REMOVED to p.removed.joinToString("\n"),
             K_WIDGETS to (OsWidgets.norm(p.widgets).joinToString("\n").ifEmpty { EMPTY }),
-            K_LAUNCHER to if (p.launcher) "1" else "0",
+            K_VOLUME to p.volume.coerceIn(0, 100).toString(),
+            K_BRIGHTNESS to p.brightness.coerceIn(MIN_BRIGHTNESS, 100).toString(),
+            K_LAST_APP to p.lastApp,
         )
 
         /** The old Home board's accent names (HomeLook.accents, dark values) as BlazeOS accents. */
@@ -409,7 +425,7 @@ data class OsPrefs(
 
         /**
          * One-time migration from before BlazeOS (no `bos_v` yet): the keys to write. A Home board photo background
-         * becomes the photo wallpaper (the same file is read), the board accent carries over, and the app's light theme
+         * becomes the photo wallpaper (BlazeOS copies the file onto its own disk at boot), the board accent carries over, and the app's light theme
          * gives BlazeOS's light look. Nothing old is touched. Empty when already migrated.
          */
         fun migrate(get: (String) -> String?): Map<String, String> {

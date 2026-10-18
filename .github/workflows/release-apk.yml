@@ -1,0 +1,54 @@
+name: Release APK
+
+# Attaches the APK built by a Build APK run to a GitHub Release (created on the given commit when missing).
+# Run by hand (workflow_dispatch); uses only the workflow's own GITHUB_TOKEN.
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Build APK run id whose artifact to publish'
+        required: true
+      tag:
+        description: 'Release tag, e.g. v0.33.2'
+        required: true
+      sha:
+        description: 'Commit the tag points at (when the release does not exist yet)'
+        required: true
+      asset:
+        description: 'File name for the APK on the release'
+        required: true
+      title:
+        description: 'Release title'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Download the run's APK
+        run: |
+          gh run download "${{ inputs.run_id }}" --repo "$REPO" --dir art
+          APK=$(find art -name '*.apk' | head -1)
+          test -n "$APK"
+          cp "$APK" "${{ inputs.asset }}"
+          ls -la "${{ inputs.asset }}"
+          sha256sum "${{ inputs.asset }}"
+      - name: Create or update the release
+        run: |
+          T="${{ inputs.title }}"; [ -n "$T" ] || T="Blaze ${{ inputs.tag }}"
+          if gh release view "${{ inputs.tag }}" --repo "$REPO" >/dev/null 2>&1; then
+            gh release upload "${{ inputs.tag }}" "${{ inputs.asset }}" --clobber --repo "$REPO"
+          else
+            gh release create "${{ inputs.tag }}" "${{ inputs.asset }}" --repo "$REPO" --target "${{ inputs.sha }}" --title "$T" \
+              --notes "Built by Build APK run ${{ inputs.run_id }} from ${{ inputs.sha }}." --latest
+          fi
+          gh release view "${{ inputs.tag }}" --repo "$REPO" --json assets --jq '.assets[].url'

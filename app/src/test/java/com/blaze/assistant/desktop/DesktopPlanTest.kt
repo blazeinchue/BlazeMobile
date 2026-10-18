@@ -20,7 +20,7 @@ class DesktopPlanTest {
 
     @Test fun installsFreeDesktopBits() {
         val i = DesktopPlan.installScript()
-        listOf("xfce4", "xfce4-terminal", "thunar", "tigervnc", "xdotool", "imagemagick", "font-dejavu", "netsurf").forEach { assertTrue(it, i.contains(" $it")) }
+        listOf("xfce4", "xfce4-terminal", "thunar", "tigervnc", "xdotool", "imagemagick", "font-dejavu", "dillo").forEach { assertTrue(it, i.contains(" $it")) }
         assertTrue(i.contains(DesktopPlan.INSTALLED_MARK))
         assertTrue(DesktopPlan.sizeLine().contains("Wi-Fi"))
     }

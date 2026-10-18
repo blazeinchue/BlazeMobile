@@ -50,7 +50,8 @@ object DesktopInstall {
     /** The plain error once every try failed. */
     fun failLine(f: Fail, tail: String): String = when (f) {
         Fail.SPACE -> "The phone ran out of space. Free up about ${DesktopPlan.DISK_MB} MB, then tap Start to carry on."
-        Fail.NETWORK, Fail.MISSING -> "The connection kept dropping, so the desktop isn't fully downloaded yet. What's downloaded so far is kept: tap Start to carry on."
+        Fail.NETWORK -> "The connection kept dropping, so the desktop isn't fully downloaded yet. What's downloaded so far is kept: tap Start to carry on."
+        Fail.MISSING -> "A desktop package isn't on the download servers right now. What's downloaded so far is kept: tap Start to try again later."
         Fail.OTHER -> "The desktop couldn't be installed. Tap Start to try again; what's downloaded so far is kept." +
             tail.lines().lastOrNull { it.contains("ERROR", true) }?.let { " (" + it.substringAfter("ERROR:").trim().take(120) + ")" }.orEmpty()
     }
@@ -87,6 +88,9 @@ object DesktopInstall {
                 }
                 if (r.code == 0 && "BLAZE_STEP_OK" in r.tail) { needUpdate = false; failsHere = 0; break }
                 val f = classify(r.tail)
+                // v0.33.4: a package that isn't on the mirror never appears by retrying; skip optional extras after one fresh-list retry.
+                if (f == Fail.MISSING && pkgs in DesktopPlan.OPTIONAL && attempt >= 2) { needUpdate = false; break }
+                if (f == Fail.MISSING && attempt >= 3) return failLine(f, r.tail)
                 if (f == Fail.SPACE || attempt >= tries) return failLine(f, r.tail)
                 attempt++
                 failsHere++

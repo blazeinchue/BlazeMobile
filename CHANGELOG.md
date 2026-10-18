@@ -5,6 +5,10 @@ Newest first. Builds before v0.8.0 were numbered 1.0–1.17.0; `versionCode` has
 
 
 
+## v0.33.4: the Linux desktop install gets past the browser step (versionCode 133)
+
+- **Desktop install no longer stalls on "The package list changed. Retrying (n of 12)"**: the last batch asked for `netsurf`, which isn't in Alpine 3.20 (main or community), so every retry failed the same way. The desktop's small browser is now **Dillo** (in community for aarch64, armv7 and x86_64), every other package was checked against the 3.20 indexes, and the extras (ImageMagick, the browser) are optional: if one is missing from the mirror it's skipped after one fresh-list retry instead of failing the install. A missing required package stops after 3 tries with a plain message, instead of spending all 12.
+
 ## v0.33.3: links open their apps, a full-screen browser, a fast screen look, a desktop install that finishes, your apps found (versionCode 132)
 
 Fixes from a Galaxy A12.

@@ -95,7 +95,7 @@ shipped inside the APK. Each keeps its own licence (as packaged by Alpine; `apk 
 | tigervnc (Xvnc, vncpasswd) | TigerVNC | GPL-2.0-or-later |
 | xdotool | xdotool | BSD-3-Clause |
 | imagemagick (import) | ImageMagick | ImageMagick License (Apache-2.0 style) |
-| netsurf | NetSurf | GPL-2.0-only |
+| dillo | Dillo | GPL-3.0-or-later |
 | dbus, dbus-x11 | freedesktop.org D-Bus | AFL-2.1 OR GPL-2.0-or-later |
 | font-dejavu | DejaVu Fonts | Bitstream Vera Fonts License (free) |
 | adwaita-icon-theme | GNOME | LGPL-3.0-or-later OR CC-BY-SA-3.0 |

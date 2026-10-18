@@ -20,7 +20,7 @@ object DesktopPlan {
     /** XFCE (desktop, terminal, file manager), a small browser, fonts, the VNC server and the agent's tools. */
     val PACKAGES = listOf(
         "xfce4", "xfce4-terminal", "thunar", "mousepad", "xfce4-session", "xfwm4", "xfdesktop", "xfce4-panel",
-        "adwaita-icon-theme", "font-dejavu", "dbus", "dbus-x11", "tigervnc", "xdotool", "imagemagick", "netsurf",
+        "adwaita-icon-theme", "font-dejavu", "dbus", "dbus-x11", "tigervnc", "xdotool", "imagemagick", "dillo",
     )
     /** Download / on-disk estimates for the plain-words line before installing (measured on Alpine 3.20 aarch64, rounded up). */
     const val DOWNLOAD_MB = 260
@@ -51,8 +51,11 @@ object DesktopPlan {
         listOf("xfce4", "adwaita-icon-theme"),
         listOf("xfce4-terminal", "thunar", "mousepad"),
         listOf("imagemagick"),
-        listOf("netsurf"),
+        listOf("dillo"),
     )
+
+    /** v0.33.4: nice-to-have batches; a package missing from the mirror skips these instead of failing the whole install. */
+    val OPTIONAL: Set<List<String>> = setOf(listOf("imagemagick"), listOf("dillo"))
 
     /** apk waits this long with no progress before giving up on a connection (its default is 60 s). */
     const val APK_TIMEOUT = 120
@@ -107,7 +110,7 @@ object DesktopPlan {
 
     /** Stops everything the desktop started and frees its memory. */
     const val STOP_SCRIPT = "pkill -f xfce4-session; pkill -f xfwm4; pkill -f xfdesktop; pkill -f xfce4-panel; pkill -f Thunar; " +
-        "pkill -f netsurf; pkill -f dbus-daemon; pkill -f Xvnc; rm -f /tmp/.X1-lock /tmp/.X11-unix/X1; echo stopped"
+        "pkill -f dillo; pkill -f dbus-daemon; pkill -f Xvnc; rm -f /tmp/.X1-lock /tmp/.X11-unix/X1; echo stopped"
 
     const val ALIVE_SCRIPT = "[ -e /tmp/.X11-unix/X1 ] && pgrep -f Xvnc >/dev/null && echo up || echo down"
 
@@ -127,7 +130,7 @@ object DesktopPlan {
     fun appCommand(app: String): String = when (app.trim().lowercase()) {
         "terminal", "xfce4-terminal" -> "xfce4-terminal"
         "files", "file manager", "thunar" -> "thunar"
-        "browser", "web", "netsurf" -> "netsurf-gtk3"
+        "browser", "web", "netsurf", "dillo" -> "dillo"
         "editor", "text editor", "mousepad" -> "mousepad"
         else -> app.trim()
     }

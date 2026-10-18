@@ -94,6 +94,32 @@ class DesktopInstallTest {
         assertEquals(DesktopInstall.failLine(Fail.NETWORK, ""), r)
     }
 
+    @Test fun missingOptionalPackageIsSkippedNotFatal() {
+        var browserTries = 0
+        val missing = Result(1, "ERROR: unable to select packages:\n  dillo (no such package)")
+        val r = DesktopInstall.run(exec = { s, _ ->
+            when {
+                s.contains("BLAZE_DESKTOP_INSTALLED") -> done
+                s.contains("add dillo") -> { browserTries++; missing }
+                else -> ok
+            }
+        }, status = { _, _ -> }, sleep = { })
+        assertNull(r)
+        assertEquals(2, browserTries)
+    }
+
+    @Test fun missingRequiredPackageStopsAfterThreeTries() {
+        var n = 0
+        val r = DesktopInstall.run(exec = { s, _ -> if (s.contains("add tigervnc")) { n++; Result(1, "ERROR: unable to select packages:\n  tigervnc (no such package)") } else ok },
+            status = { _, _ -> }, sleep = { })
+        assertEquals(3, n); assertEquals(DesktopInstall.failLine(Fail.MISSING, ""), r)
+    }
+
+    @Test fun everyDesktopPackageIsOnAlpine320() {
+        // Checked against the v3.20 main + community indexes on 2026-10-18 (netsurf isn't there; dillo is).
+        assertTrue("netsurf" !in DesktopPlan.PACKAGES); assertTrue("dillo" in DesktopPlan.PACKAGES)
+    }
+
     @Test fun outOfSpaceStopsAtOnce() {
         var n = 0
         val r = DesktopInstall.run(exec = { s, _ -> if (s.contains("add ")) { n++; Result(1, "ERROR: No space left on device") } else ok },

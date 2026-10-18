@@ -47,7 +47,7 @@ object DesktopNarration {
     fun appName(app: String): String = when (app.trim().lowercase()) {
         "terminal", "xfce4-terminal" -> "Terminal"
         "files", "file manager", "thunar" -> "Files"
-        "browser", "web", "netsurf", "netsurf-gtk3" -> "the browser"
+        "browser", "web", "netsurf", "netsurf-gtk3", "dillo" -> "the browser"
         "editor", "text editor", "mousepad" -> "Text Editor"
         "" -> "an app"
         else -> app.trim().substringBefore(' ').substringAfterLast('/').take(24).ifEmpty { "an app" }

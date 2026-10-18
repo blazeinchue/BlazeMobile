@@ -31,6 +31,9 @@ import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
@@ -98,6 +101,11 @@ import androidx.media3.ui.PlayerView
 import com.blaze.assistant.mediaapps.store.StoreDetail
 import com.blaze.assistant.mediaapps.store.StoreItem
 import com.blaze.assistant.mediaapps.store.StoreSource
+import com.blaze.assistant.mediaapps.store.StoreSubtitle
+import com.blaze.assistant.mediaapps.store.LinkSource
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.media3.exoplayer.source.MediaSource
+import android.widget.Toast
 import com.blaze.assistant.ui.BackButton
 import com.blaze.assistant.ui.BlazeBrush
 import com.blaze.assistant.ui.BlazeDialog
@@ -134,6 +142,22 @@ class VideoActivity : ComponentActivity() {
     /** The video loaded now (library track, or a Store stream). */
     val current = mutableStateOf<Track?>(null)
 
+    // ---------------------------------------------------------------- v0.34.0 subtitles
+    /** The player's tracks, updated live in onTracksChanged (the menu used to read them once and never again). */
+    val tracks = mutableStateOf(Tracks.EMPTY)
+    /** Subtitle tracks this video offers that the player may not have yet (YouTube captions, saved files). */
+    val subsAvailable = mutableStateOf<List<StoreSubtitle>>(emptyList())
+    /** Id of the track being fetched for the menu ("" = none). */
+    val subsBusy = mutableStateOf("")
+    val subsError = mutableStateOf("")
+    /** Tracks side-loaded into the player now (local .vtt files). */
+    private val subsLoaded = ArrayList<StoreSubtitle>()
+    /** What [current] plays from, so it can be rebuilt with more subtitle tracks at the same spot. */
+    private var playUris: List<String> = emptyList()
+    /** A subtitle id to select as soon as the player reports it. */
+    private var pendingSub: String? = null
+    private val pickSubFile = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> if (uri != null) loadSubtitleFile(uri) }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -153,6 +177,10 @@ class VideoActivity : ComponentActivity() {
             }
             override fun onPlaybackStateChanged(state: Int) { if (state == Player.STATE_ENDED) current.value?.let { MediaLib.savePosition(it.key, 0, 1) } }
             override fun onPlayerError(error: PlaybackException) { retryStream(error) }
+            override fun onTracksChanged(t: Tracks) {
+                tracks.value = t
+                pendingSub?.let { id -> if (selectSubtitle(id)) pendingSub = null }
+            }
         })
         StoragePermission.asker = null
         setContent { BlazeTheme { VideoApp(this) } }
@@ -174,10 +202,120 @@ class VideoActivity : ComponentActivity() {
         savePos()
         current.value = t
         MediaLib.played(t)
-        player.setMediaItem(MediaItem.Builder().setMediaId(t.key).setUri(t.uri)
-            .setMediaMetadata(MediaMetadata.Builder().setTitle(t.title).build()).build(), ResumeLogic.resumeAt(MediaLib.position(t.key), t.durationMs))
-        player.prepare(); player.play()
+        playUris = listOf(t.uri)
+        resetSubs(SubsLoader.saved(this, t.key))
+        val at = ResumeLogic.resumeAt(MediaLib.position(t.key), t.durationMs)
+        // Saved subtitles (a file loaded before, captions kept with a download) come back by themselves; a downloaded
+        // YouTube video also gets its YouTube caption list when online.
+        Subs.pick(subsAvailable.value, SubsLoader.pref(this))?.let { subsLoaded += it; pendingSub = it.id }
+        subsLoaded.addAll(subsAvailable.value.filter { s -> subsLoaded.none { it.id == s.id } })
+        load(at, true)
         tab.value = "player"
+        if (t.videoId.isNotBlank()) lifecycleScope.launch {
+            val yt = try { LinkSource.ytCaptions(t.videoId) } catch (_: Exception) { emptyList() }
+            if (current.value?.key == t.key) mergeAvailable(yt)
+        }
+    }
+
+    private fun resetSubs(saved: List<StoreSubtitle>) {
+        subsLoaded.clear(); pendingSub = null; subsBusy.value = ""; subsError.value = ""
+        subsAvailable.value = saved
+    }
+
+    private fun mergeAvailable(more: List<StoreSubtitle>) {
+        val have = subsAvailable.value
+        subsAvailable.value = have + more.filter { m -> have.none { it.id == m.id } }
+    }
+
+    /** (Re)loads [current] from [playUris] with every side-loaded subtitle in [subsLoaded], at [at]. */
+    private fun load(at: Long, play: Boolean) {
+        val t = current.value ?: return
+        val subs = subsLoaded.map { SubsLoader.config(it, it.id == pendingSub) }
+        val first = MediaItem.Builder().setMediaId(t.key).setUri(playUris.first())
+            .setMediaMetadata(MediaMetadata.Builder().setTitle(t.title).build()).setSubtitleConfigurations(subs).build()
+        if (playUris.size == 1) player.setMediaItem(first, at)
+        else {
+            val msf = DefaultMediaSourceFactory(DefaultDataSource.Factory(this, http))
+            val parts = ArrayList<MediaSource>()
+            parts += msf.createMediaSource(first)
+            playUris.drop(1).forEach { parts += ProgressiveMediaSource.Factory(DefaultDataSource.Factory(this, http)).createMediaSource(MediaItem.fromUri(it)) }
+            player.setMediaSource(MergingMediaSource(*parts.toTypedArray()), at)
+        }
+        if (pendingSub != null) player.trackSelectionParameters = player.trackSelectionParameters.buildUpon().setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false).build()
+        player.prepare(); player.playWhenReady = play
+    }
+
+    /** Turns on the player's text track with this id (side-loaded tracks keep their SubtitleConfiguration id). */
+    fun selectSubtitle(id: String): Boolean {
+        val label = (subsLoaded + subsAvailable.value).firstOrNull { it.id == id }?.let { Subs.label(it) }
+        for (g in player.currentTracks.groups) {
+            if (g.type != C.TRACK_TYPE_TEXT) continue
+            for (i in 0 until g.length) {
+                val f = g.getTrackFormat(i)
+                if (f.id == id || f.id?.endsWith(":$id") == true || (label != null && f.label == label)) {
+                    player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
+                        .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
+                        .setOverrideForType(TrackSelectionOverride(g.mediaTrackGroup, i)).build()
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    fun subtitlesOff() {
+        pendingSub = null
+        player.trackSelectionParameters = player.trackSelectionParameters.buildUpon().clearOverridesOfType(C.TRACK_TYPE_TEXT).setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true).build()
+        SubsLoader.setPref(this, "off")
+    }
+
+    /** The user picked a subtitle in the menu: select it, or fetch it first (YouTube) and add it to the player. */
+    fun chooseSubtitle(item: Subs.MenuItem) {
+        if (item.lang.isNotBlank()) SubsLoader.setPref(this, item.lang)
+        if (item.loaded || subsLoaded.any { it.id == item.id }) {
+            if (!selectSubtitle(item.id)) pendingSub = item.id
+            return
+        }
+        val t = current.value ?: return
+        val track = subsAvailable.value.firstOrNull { it.id == item.id } ?: return
+        subsBusy.value = track.id; subsError.value = ""
+        lifecycleScope.launch {
+            val local = if (track.url.startsWith("file:")) track else {
+                val cues = try { SubsLoader.fetchYouTube(track) } catch (_: Exception) { emptyList() }
+                if (cues.isEmpty()) null else withContext(Dispatchers.IO) { SubsLoader.save(this@VideoActivity, t.key, track, cues) }
+            }
+            subsBusy.value = ""
+            if (current.value?.key != t.key) return@launch
+            if (local == null) { subsError.value = "YouTube didn't send the ${Subs.label(track)} subtitles. Try again, or load a file."; return@launch }
+            attach(local)
+        }
+    }
+
+    /** Adds a saved track to the player (rebuilding the source at the same spot) and selects it. */
+    private fun attach(local: StoreSubtitle) {
+        subsLoaded.removeAll { it.id == local.id }; subsLoaded += local
+        subsAvailable.value = subsAvailable.value.map { if (it.id == local.id) local else it }.let { l -> if (l.any { it.id == local.id }) l else l + local }
+        pendingSub = local.id
+        load(player.currentPosition, player.playWhenReady)
+    }
+
+    fun openSubtitleFile() {
+        runCatching { pickSubFile.launch(arrayOf("application/x-subrip", "text/vtt", "text/plain", "application/octet-stream", "*/*")) }
+    }
+
+    /** A .srt / .vtt from the phone: parsed, kept with this video, added and turned on. */
+    fun loadSubtitleFile(uri: Uri) {
+        val t = current.value ?: return
+        lifecycleScope.launch {
+            try {
+                val (name, cues) = SubsLoader.readFile(this@VideoActivity, uri)
+                val id = "file-" + Subs.folderFor(uri.toString()).take(8)
+                val local = withContext(Dispatchers.IO) { SubsLoader.save(this@VideoActivity, t.key, StoreSubtitle(id, "", "", name.substringBeforeLast('.'), false), cues) }
+                if (current.value?.key == t.key) attach(local)
+            } catch (e: Exception) {
+                Toast.makeText(this@VideoActivity, e.message ?: "Couldn't read that subtitle file.", Toast.LENGTH_LONG).show()
+            }
+        }
     }
 
     private var lastWatch: Pair<StoreItem, StoreSource>? = null
@@ -208,13 +346,27 @@ class VideoActivity : ComponentActivity() {
         Taste.note(this, "video", d.title.ifBlank { item.title }, d.author.ifBlank { item.author }, Taste.PLAY)
         val t = Track("stream:${item.source}:${item.id}", picks[0].url, d.title.ifBlank { item.title }, d.author.ifBlank { item.author }, "",
             d.lengthSec * 1000L, item.thumb, "stream", 0, item.id, "video", d.licence.ifBlank { item.licence }, item.source)
+        val same = current.value?.key == t.key
         current.value = t
-        val factory = ProgressiveMediaSource.Factory(DefaultDataSource.Factory(this, http))
-        if (picks.size == 1) player.setMediaItem(MediaItem.Builder().setMediaId(t.key).setUri(picks[0].url).build())
-        else player.setMediaSource(MergingMediaSource(*picks.map { factory.createMediaSource(MediaItem.fromUri(it.url)) }.toTypedArray()))
-        if (at > 0) player.seekTo(at)
-        player.prepare(); player.play()
+        playUris = picks.map { it.url }
+        val keep = if (same) subsLoaded.toList() else emptyList()
+        if (!same) resetSubs(SubsLoader.saved(this, t.key))
+        mergeAvailable(d.subtitles)
+        subsLoaded.clear(); subsLoaded.addAll(keep)
         tab.value = "player"
+        // The viewer's subtitle language (if they turned subtitles on before) is fetched first, ~4 s at most, so the
+        // video starts with it on; any other track loads when picked in the menu.
+        val want = if (keep.isEmpty()) Subs.pick(subsAvailable.value, SubsLoader.pref(this)) else null
+        if (want == null) { load(at, true); return }
+        lifecycleScope.launch {
+            val local = if (want.url.startsWith("file:")) want else kotlinx.coroutines.withTimeoutOrNull(4_000) {
+                val cues = SubsLoader.fetchYouTube(want)
+                if (cues.isEmpty()) null else withContext(Dispatchers.IO) { SubsLoader.save(this@VideoActivity, t.key, want, cues) }
+            }
+            if (current.value?.key != t.key) return@launch
+            if (local != null) { subsLoaded += local; subsAvailable.value = subsAvailable.value.map { if (it.id == local.id) local else it }; pendingSub = local.id }
+            load(at, true)
+        }
     }
 
     fun pipParams(): PictureInPictureParams {
@@ -456,14 +608,22 @@ private fun PlayerSurface(a: VideoActivity, controls: Boolean) {
             }
         }
     }
-    if (tracksOpen) TracksDialog(p) { tracksOpen = false }
+    if (tracksOpen) TracksDialog(a) { tracksOpen = false }
 }
 
-/** Subtitles and audio tracks the video carries (embedded tracks). Off = no subtitles. */
+/**
+ * Subtitles and audio. v0.34.0: reads the player's tracks live ([VideoActivity.tracks], from onTracksChanged), lists
+ * YouTube's caption tracks and saved files that aren't loaded yet (picking one fetches it and adds it), and loads a
+ * .srt / .vtt from the phone. Off = no subtitles (remembered).
+ */
 @Composable
-private fun TracksDialog(p: ExoPlayer, onDismiss: () -> Unit) {
-    val groups = remember { p.currentTracks.groups }
-    val subs = groups.filter { it.type == C.TRACK_TYPE_TEXT && it.isSupported }
+private fun TracksDialog(a: VideoActivity, onDismiss: () -> Unit) {
+    val p = a.player
+    val tracks by a.tracks
+    val available by a.subsAvailable
+    val busy by a.subsBusy
+    val err by a.subsError
+    val groups = tracks.groups
     val audio = groups.filter { it.type == C.TRACK_TYPE_AUDIO && it.isSupported }
     val textOff = p.trackSelectionParameters.disabledTrackTypes.contains(C.TRACK_TYPE_TEXT)
     fun name(g: Tracks.Group, i: Int, n: Int): String {
@@ -471,25 +631,39 @@ private fun TracksDialog(p: ExoPlayer, onDismiss: () -> Unit) {
         return listOfNotNull(f.label, f.language?.let { java.util.Locale(it).displayLanguage.ifBlank { it } }).firstOrNull()
             ?: ((if (g.type == C.TRACK_TYPE_TEXT) "Subtitles " else "Audio ") + (n + 1))
     }
-    fun select(g: Tracks.Group, i: Int) {
-        p.trackSelectionParameters = p.trackSelectionParameters.buildUpon()
-            .setTrackTypeDisabled(g.type, false)
-            .setOverrideForType(TrackSelectionOverride(g.mediaTrackGroup, i)).build()
-        onDismiss()
-    }
-    BlazeDialog("Subtitles and audio", confirm = "Done", onConfirm = onDismiss, onDismiss = onDismiss) {
-        Column(Modifier.fillMaxWidth()) {
-            MText("Subtitles", 12.sp, DialogColors.body, FontWeight.Medium)
-            Option("Off", subs.isEmpty() || textOff) {
-                p.trackSelectionParameters = p.trackSelectionParameters.buildUpon().setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true).build(); onDismiss()
+    val inPlayer = ArrayList<Pair<Subs.MenuItem, () -> Unit>>()
+    var n = 0
+    groups.filter { it.type == C.TRACK_TYPE_TEXT && it.isSupported }.forEach { g ->
+        for (i in 0 until g.length) {
+            val k = n++
+            val f = g.getTrackFormat(i)
+            val id = available.firstOrNull { s -> f.id == s.id || f.id?.endsWith(":" + s.id) == true || f.label == Subs.label(s) }?.id ?: (f.id ?: "track-$k")
+            inPlayer += Subs.MenuItem(id, name(g, i, k), f.language.orEmpty(), true, !textOff && g.isTrackSelected(i)) to {
+                f.language?.let { l -> SubsLoader.setPref(a, l) }
+                p.trackSelectionParameters = p.trackSelectionParameters.buildUpon().setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
+                    .setOverrideForType(TrackSelectionOverride(g.mediaTrackGroup, i)).build()
             }
-            var n = 0
-            subs.forEach { g -> for (i in 0 until g.length) { val k = n++; Option(name(g, i, k), !textOff && g.isTrackSelected(i)) { select(g, i) } } }
-            if (subs.isEmpty()) MText("This video has no subtitles.", 12.5.sp, DialogColors.body)
+        }
+    }
+    val menu = Subs.menu(inPlayer.map { it.first }, available, java.util.Locale.getDefault().language)
+    val anyOn = menu.any { it.selected }
+    BlazeDialog("Subtitles and audio", confirm = "Done", onConfirm = onDismiss, onDismiss = onDismiss) {
+        Column(Modifier.fillMaxWidth().heightIn(max = 460.dp).verticalScroll(rememberScrollState())) {
+            MText("Subtitles", 12.sp, DialogColors.body, FontWeight.Medium)
+            Option("Off", !anyOn) { a.subtitlesOff() }
+            menu.forEach { m ->
+                val action = inPlayer.firstOrNull { it.first.id == m.id }?.second
+                Option(m.label + if (busy == m.id) "  · loading…" else "", m.selected) { if (action != null) action() else a.chooseSubtitle(m) }
+            }
+            if (menu.isEmpty()) MText("This video has no subtitles of its own. Load a .srt or .vtt file.", 12.5.sp, DialogColors.body, maxLines = 3)
+            if (err.isNotBlank()) MText(err, 12.5.sp, Color(0xFFE5484D), maxLines = 3)
+            Option("Load a subtitle file (.srt, .vtt)…", false) { a.openSubtitleFile() }
             Spacer(Modifier.height(10.dp))
             MText("Audio", 12.sp, DialogColors.body, FontWeight.Medium)
-            n = 0
-            audio.forEach { g -> for (i in 0 until g.length) { val k = n++; Option(name(g, i, k), g.isTrackSelected(i)) { select(g, i) } } }
+            var m2 = 0
+            audio.forEach { g -> for (i in 0 until g.length) { val k = m2++; Option(name(g, i, k), g.isTrackSelected(i)) {
+                p.trackSelectionParameters = p.trackSelectionParameters.buildUpon().setOverrideForType(TrackSelectionOverride(g.mediaTrackGroup, i)).build()
+            } } }
         }
     }
 }

@@ -114,7 +114,8 @@ object Rfb {
      * One connection. [onFrame] runs on the socket thread after each update (the viewer just invalidates);
      * [onClosed] gets the reason ("" for a normal stop).
      */
-    class Client(private val password: String, private val onFrame: () -> Unit, private val onClosed: (String) -> Unit) {
+    class Client(private val password: String, private val onFrame: () -> Unit, private val onClosed: (String) -> Unit,
+                 private val onCutText: (String) -> Unit = {}) {
         @Volatile var width = 0; private set
         @Volatile var height = 0; private set
         @Volatile var fb = ShortArray(0); private set
@@ -146,6 +147,8 @@ object Rfb {
         fun scroll(x: Int, y: Int, up: Boolean) { val m = if (up) 8 else 16; pointer(m, x, y); pointer(0, x, y) }
         fun key(keysym: Int) { send(Msg.key(true, keysym)); send(Msg.key(false, keysym)) }
         fun type(text: String) = text.forEach { key(keysym(it)) }
+        /** v0.34.0: the phone's clipboard into the desktop's (ClientCutText). */
+        fun cutText(text: String) = send(DesktopExtras.clientCutText(text))
 
         private fun session(host: String, port: Int) {
             val s = Socket(); s.tcpNoDelay = true; s.connect(InetSocketAddress(host, port), 5_000); s.soTimeout = 0
@@ -196,7 +199,13 @@ object Rfb {
                     }
                     1 -> { inp.readByte(); inp.readUnsignedShort(); val k = inp.readUnsignedShort(); inp.readFully(ByteArray(k * 6)) }
                     2 -> Unit
-                    3 -> { inp.readFully(ByteArray(3)); inp.readFully(ByteArray(inp.readInt().coerceIn(0, 1 shl 20))) }
+                    3 -> {
+                        // v0.34.0 ServerCutText: something was copied in the desktop -> the phone's clipboard (up to 1 MB; more is skipped).
+                        inp.readFully(ByteArray(3))
+                        val n = inp.readInt()
+                        if (n in 0..(1 shl 20)) { val b = ByteArray(n); inp.readFully(b); try { onCutText(DesktopExtras.serverCutText(b)) } catch (_: Exception) { } }
+                        else { var left = n.toLong() and 0xFFFFFFFFL; while (left > 0) { val k = inp.skipBytes(minOf(left, 65536L).toInt()); if (k <= 0) { inp.readByte(); left-- } else left -= k } }
+                    }
                     else -> throw IllegalStateException("unexpected message $t")
                 }
             }

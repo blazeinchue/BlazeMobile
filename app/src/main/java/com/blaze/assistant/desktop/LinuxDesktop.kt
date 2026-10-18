@@ -45,6 +45,10 @@ object LinuxDesktop {
     private const val PREF_DISTRO = "linux_desktop_distro"
     /** v0.33.5: a download the user paused (shown as "Download paused" after Blaze restarts). */
     private const val PREF_PAUSED = "linux_desktop_paused"
+    /** v0.34.0: screen size + colour depth ("1280x720@16"), used from the next start. */
+    private const val PREF_DISPLAY = "linux_desktop_display"
+    /** v0.34.0: restart the desktop by itself when it dies (on by default, at most 3 times in 10 minutes). */
+    private const val PREF_AUTORESTART = "linux_desktop_autorestart"
 
     /** v0.33.5: Stop for the running download / install (page button and the notification's Stop). */
     private val stopToken = StopToken()
@@ -118,12 +122,14 @@ object LinuxDesktop {
     /** Installs if needed, then starts. Safe to call twice. Returns a plain sentence. */
     suspend fun start(ctx: Context): String = lock.withLock {
         if (!cpuOk()) { set(Phase.UNSUPPORTED, DesktopPlan.UNSUPPORTED); return DesktopPlan.UNSUPPORTED }
-        if (alive()) { set(Phase.RUNNING, "Running"); return "The desktop is running." }
+        if (alive()) { set(Phase.RUNNING, "Running"); appCtx = ctx.applicationContext; userStopped = false; startWatchdog(); return "The desktop is running." }
         if (freeMb(ctx) < DesktopPlan.MIN_FREE_MB) {
             val m = "Your phone is low on free memory right now. Close a few apps, then tap Start again."
             set(Phase.ERROR, m, err = m); return m
         }
         stopToken.reset()
+        userStopped = false
+        appCtx = ctx.applicationContext
         Settings.setBool(PREF_PAUSED, false)
         DesktopKeeper.clearPaused(ctx.applicationContext)
         val d = distro()
@@ -153,9 +159,10 @@ object LinuxDesktop {
             password = DesktopPlan.password()
             Terminal.run(DesktopPlan.passwdScript(password), timeoutSec = 30, linux = true, distro = d.id)
             Terminal.run(DesktopPlan.STOP_SCRIPT, timeoutSec = 20, linux = true, distro = d.id)
-            val out = Terminal.startJob(DesktopPlan.startScript(), linux = true, maxMinutes = 0, distro = d.id)
+            val disp = display()
+            val out = Terminal.startJob(DesktopPlan.startScript(disp.w, disp.h, disp.depth), linux = true, maxMinutes = 0, distro = d.id)
             jobId = Regex("Started job (\\d+)").find(out)?.groupValues?.get(1)?.toIntOrNull() ?: 0
-            repeat(40) { if (alive()) { Settings.setBool(PREF_ON, true); set(Phase.RUNNING, "Running"); return "The desktop is running. Open the Desktop view to see it." }; delay(500) }
+            repeat(40) { if (alive()) { Settings.setBool(PREF_ON, true); running = disp; set(Phase.RUNNING, "Running"); startWatchdog(); return "The desktop is running. Open the Desktop view to see it." }; delay(500) }
             val log = Terminal.run("tail -n 5 /tmp/xvnc.log 2>/dev/null", timeoutSec = 10, linux = true, distro = d.id)
             val m = "The desktop didn't start. " + log.lines().drop(1).joinToString(" ").take(200)
             set(Phase.ERROR, m, err = m); m
@@ -310,6 +317,8 @@ object LinuxDesktop {
     /** Kills every desktop process and frees its memory. */
     suspend fun stop(): String {
         set(Phase.STOPPING, "Stopping\u2026")
+        userStopped = true
+        watchdog?.cancel(); watchdog = null
         Settings.setBool(PREF_ON, false)
         try { Terminal.run(DesktopPlan.STOP_SCRIPT, timeoutSec = 20, linux = true, distro = did()) } catch (_: Exception) { }
         if (jobId > 0) try { Terminal.stopJob(jobId) } catch (_: Exception) { }
@@ -320,17 +329,184 @@ object LinuxDesktop {
     }
 
     /** The viewer lost its connection: if the X server is gone, Android (or a crash) ended it. */
-    fun lost() { scope.launch { if (!alive()) set(Phase.KILLED, DesktopPlan.KILLED_NOTE) } }
+    fun lost() { scope.launch { if (!alive() && !watchdogCheck()) set(Phase.KILLED, DesktopPlan.KILLED_NOTE) } }
+
+    // ---------- v0.34.0 auto-restart watchdog ----------
+    @Volatile private var userStopped = false
+    @Volatile private var appCtx: Context? = null
+    @Volatile private var watchdog: kotlinx.coroutines.Job? = null
+    private val restarts = ArrayList<Long>()
+
+    fun autoRestart(): Boolean = try { Settings.bool(PREF_AUTORESTART, true) } catch (_: Throwable) { true }
+    fun setAutoRestart(on: Boolean) { Settings.setBool(PREF_AUTORESTART, on); if (on && _state.value.phase == Phase.RUNNING) startWatchdog() }
+
+    /** Checks every 20 s while the desktop should be up; Android or a crash ending it brings it back ([DesktopExtras.shouldRestart]). */
+    private fun startWatchdog() {
+        if (watchdog?.isActive == true) return
+        watchdog = scope.launch {
+            while (true) {
+                delay(20_000)
+                if (userStopped || !Settings.bool(PREF_ON, false)) break
+                val ph = _state.value.phase
+                if (ph == Phase.INSTALLING || ph == Phase.STARTING || ph == Phase.STOPPING || ph == Phase.PAUSED) continue
+                if (alive()) continue
+                if (!watchdogCheck()) { if (!userStopped) set(Phase.KILLED, DesktopPlan.KILLED_NOTE); break }
+            }
+        }
+    }
+
+    /** True when it is restarting the desktop; false when the rule says no (setting off, stopped by the user, or 3 restarts in 10 min). */
+    private fun watchdogCheck(): Boolean {
+        val ctx = appCtx ?: return false
+        val now = System.currentTimeMillis()
+        val recent = synchronized(restarts) { restarts.removeAll { now - it > 10 * 60_000L }; restarts.toList() }
+        if (!DesktopExtras.shouldRestart(Settings.bool(PREF_ON, false), userStopped, alive = false, setting = autoRestart(), recent = recent, now = now)) return false
+        synchronized(restarts) { restarts += now }
+        set(Phase.STARTING, "The desktop closed. Restarting it\u2026")
+        scope.launch { start(ctx) }
+        return true
+    }
+
+    // ---------- v0.34.0 display ----------
+    fun display(): DesktopExtras.Display = try { DesktopExtras.parseDisplay(Settings.str(PREF_DISPLAY, "")) } catch (_: Throwable) { DesktopExtras.DISPLAYS[0] }
+    fun setDisplay(d: DesktopExtras.Display) = Settings.setStr(PREF_DISPLAY, DesktopExtras.displayKey(d))
+    /** The size the running desktop was started with (the setting applies from the next start). */
+    @Volatile var running: DesktopExtras.Display = DesktopExtras.DISPLAYS[0]; private set
+
+    // ---------- v0.34.0 app drawer + curated store ----------
+    private fun phoneDir(ctx: Context) = File(ctx.filesDir, "home")
+
+    /** Every app the desktop's .desktop files list (read through a file: the list is longer than a command's output keeps). */
+    suspend fun apps(ctx: Context): List<DesktopExtras.AppEntry> = withContext(Dispatchers.IO) {
+        if (!installed()) return@withContext emptyList()
+        val f = File(phoneDir(ctx), ".desktop_apps.txt"); f.delete()
+        Terminal.run("{ " + DesktopExtras.LIST_APPS_SCRIPT + "; } > /root/phone/.desktop_apps.txt 2>/dev/null; echo listed", timeoutSec = 30, linux = true, distro = did())
+        val out = try { f.readText() } catch (_: Exception) { "" }
+        f.delete()
+        DesktopExtras.parseEntries(out)
+    }
+
+    suspend fun launch(e: DesktopExtras.AppEntry): String {
+        if (!alive()) return "The desktop isn't running."
+        Terminal.run(DesktopExtras.launchCmd(e), timeoutSec = 15, linux = true, distro = did())
+        return "Opened ${e.name}."
+    }
+
+    suspend fun launchStore(app: DesktopExtras.StoreApp): String {
+        if (!alive()) return "Installed. Start the desktop to open it."
+        Terminal.run(DesktopExtras.launchApp(app), timeoutSec = 15, linux = true, distro = did())
+        return "Opened ${app.name}."
+    }
+
+    /** One store install at a time (its progress, for the page). */
+    val storeBusy = MutableStateFlow<String?>(null)
+    val storeLine = MutableStateFlow("")
+
+    /** Installs a curated app with the Linux's own package manager; returns a plain sentence. No time limit (LibreOffice is big). */
+    suspend fun installApp(app: DesktopExtras.StoreApp): String = withContext(Dispatchers.IO) {
+        val d = distro()
+        if (!installed(d)) return@withContext "Install the desktop first (Start on the Desktop page)."
+        val script = DesktopExtras.installScript(app, d) ?: return@withContext DesktopExtras.whyNot(app, d)
+        storeBusy.value?.let { return@withContext "Already installing $it. One at a time." }
+        storeBusy.value = app.name; storeLine.value = "Installing ${app.name}\u2026"
+        try {
+            val tail = ArrayDeque<String>()
+            val p = ProcessBuilder(Linux.command(script, distro = d.id)).redirectErrorStream(true).also { it.environment().putAll(Linux.env()) }.start()
+            try { p.outputStream.close() } catch (_: Exception) { }
+            p.inputStream.bufferedReader().forEachLine { line ->
+                tail.addLast(line); if (tail.size > 8) tail.removeFirst()
+                val l = line.trim()
+                if (l.isNotEmpty()) storeLine.value = (DesktopPlan.progressLine(l)?.second ?: l).take(90)
+            }
+            val code = p.waitFor()
+            if (code == 0 && tail.any { "BLAZE_STORE_OK" in it }) "${app.name} is installed."
+            else "${app.name} didn't install: " + tail.filter { it.isNotBlank() && "BLAZE_STORE_OK" !in it }.takeLast(2).joinToString(" ").take(240)
+        } catch (e: Exception) { "${app.name} didn't install: ${e.message}" }
+        finally { storeBusy.value = null; storeLine.value = "" }
+    }
+
+    // ---------- v0.34.0 snapshots ----------
+    private fun snapDir(ctx: Context) = File(phoneDir(ctx), ".snapshots")
+
+    fun snapshots(ctx: Context): List<DesktopExtras.Snapshot> = (snapDir(ctx).listFiles() ?: emptyArray<File>())
+        .mapNotNull { f -> if (f.isFile) DesktopExtras.parseSnap(f.name, f.length()) else null }.sortedByDescending { it.at }
+
+    val snapBusy = MutableStateFlow(false)
+
+    /** Packs the chosen Linux (everything installed and changed in it) into one file in Blaze's phone folder. */
+    suspend fun createSnapshot(ctx: Context): String = withContext(Dispatchers.IO) {
+        val d = distro()
+        if (!installed(d)) return@withContext "Install the desktop first."
+        if (snapBusy.value) return@withContext "A snapshot is already being made or restored."
+        val rootBytes = sizeOf(Linux.rootfs(d.id))
+        val dir = snapDir(ctx).apply { mkdirs() }
+        if (!DesktopExtras.roomForSnapshot(rootBytes, dir.usableSpace))
+            return@withContext "Not enough free space: a snapshot of ${d.name} needs about ${(rootBytes / 2 + 200_000_000L) / 1_000_000} MB free."
+        snapBusy.value = true
+        try {
+            val name = DesktopExtras.snapName(d.id, System.currentTimeMillis())
+            val r = Terminal.run(DesktopExtras.snapshotScript(name), timeoutSec = 600, linux = true, distro = d.id)
+            if ("BLAZE_SNAP_OK" in r) "Snapshot saved (%.0f MB).".format(java.util.Locale.US, File(dir, name).length() / 1_000_000.0)
+            else { File(dir, "$name.part").delete(); "The snapshot didn't finish: " + r.lines().drop(1).filter { it.isNotBlank() }.takeLast(2).joinToString(" ").take(200) }
+        } finally { snapBusy.value = false }
+    }
+
+    /**
+     * Puts the Linux back the way it was in [snap]: unpacked next to it first, then swapped in, so a failed restore
+     * leaves the current Linux untouched. Only while the desktop is stopped.
+     */
+    suspend fun restoreSnapshot(ctx: Context, snap: DesktopExtras.Snapshot): String = withContext(Dispatchers.IO) {
+        val ph = _state.value.phase
+        if (ph == Phase.RUNNING || ph == Phase.STARTING || ph == Phase.INSTALLING || alive()) return@withContext "Stop the desktop first."
+        if (snap.distro != distro().id) return@withContext "That snapshot is of ${DesktopDistro.of(snap.distro).name}; pick that Linux first."
+        if (snapBusy.value) return@withContext "A snapshot is already being made or restored."
+        val f = File(snapDir(ctx), snap.file)
+        if (!f.isFile) return@withContext "That snapshot is gone."
+        snapBusy.value = true
+        try {
+            lock.withLock {
+                val id = snap.distro
+                val stage = File(Linux.base(), ".restore-$id"); val old = File(Linux.base(), ".old-$id")
+                try {
+                    delete(stage); delete(old); stage.mkdirs()
+                    Linux.untarStream(java.util.zip.GZIPInputStream(java.io.BufferedInputStream(f.inputStream(), 256 * 1024)), stage, 0) { }
+                    if (!File(stage, "bin/sh").exists() && !File(stage, "usr/bin/sh").exists() && !File(stage, "bin/busybox").exists()) {
+                        delete(stage); "That snapshot looks broken (no shell in it). Nothing was changed."
+                    } else {
+                        listOf("proc", "sys", "dev", "tmp", "sdcard", "root/phone").forEach { File(stage, it).mkdirs() }
+                        val r = Linux.rootfs(id)
+                        if (r.exists() && !r.renameTo(old)) { delete(stage); "Couldn't swap the Linux folders. Nothing was changed." }
+                        else if (!stage.renameTo(r)) { old.renameTo(r); "Couldn't swap the Linux folders. Nothing was changed." }
+                        else {
+                            Linux.prepare(r, id)
+                            if (!File(r, ".blaze_ok").exists()) File(r, ".blaze_ok").writeText("restored")
+                            delete(old)
+                            set(Phase.IDLE, "")
+                            "Restored the snapshot from " + java.text.DateFormat.getDateTimeInstance(java.text.DateFormat.MEDIUM, java.text.DateFormat.SHORT).format(java.util.Date(snap.at)) + "."
+                        }
+                    }
+                } catch (e: Exception) {
+                    delete(stage)
+                    if (!Linux.rootfs(id).exists() && old.exists()) old.renameTo(Linux.rootfs(id))
+                    "The restore didn't finish (${e.message ?: e.javaClass.simpleName}). Your Linux wasn't changed."
+                }
+            }
+        } finally { snapBusy.value = false }
+    }
+
+    fun deleteSnapshot(ctx: Context, snap: DesktopExtras.Snapshot): Boolean = File(snapDir(ctx), snap.file).delete()
+
 
     // ---------- agent tool ----------
     fun tool(): JSONObject = JSONObject().put("type", "function").put("function", JSONObject().put("name", "desktop")
         .put("description", "A real Linux desktop (XFCE) inside Blaze's ${distro().name} Linux (the user's choice on the Desktop page; " +
             "install software in it with ${distro().pm.tool}), shown in the Desktop view. " +
             "start (installs on first use, ~${distro().downloadMb} MB; while it downloads, stop pauses it and start resumes), stop, status, screenshot (attached as an image; coordinates are in that picture's pixels), " +
-            "click x y [button 1 left / 3 right] [double], type text, key keys (xdotool names like ctrl+s Return), run app (terminal, files, browser, editor or a command), open (show the Desktop view). " +
+            "click x y [button 1 left / 3 right] [double], type text, key keys (xdotool names like ctrl+s Return), run app (terminal, files, browser, editor or a command), open (show the Desktop view), " +
+            "apps (the installed apps), launch app=<name from apps>, store (curated apps for this Linux), install app=<store id>, snapshot (save the Linux as it is now), snapshots (list them). " +
             "For click and type, set label to what you're clicking or typing into in 1-3 plain words (\"Save\", \"Terminal\"): the user watches a live view with that label.")
         .put("parameters", JSONObject().put("type", "object").put("properties", JSONObject()
-            .put("action", JSONObject().put("type", "string").put("enum", JSONArray(listOf("start", "stop", "status", "screenshot", "click", "type", "key", "run", "open"))))
+            .put("action", JSONObject().put("type", "string").put("enum", JSONArray(listOf("start", "stop", "status", "screenshot", "click", "type", "key", "run", "open", "apps", "launch", "store", "install", "snapshot", "snapshots"))))
             .put("x", JSONObject().put("type", "integer")).put("y", JSONObject().put("type", "integer"))
             .put("button", JSONObject().put("type", "integer")).put("double", JSONObject().put("type", "boolean"))
             .put("text", JSONObject().put("type", "string")).put("keys", JSONObject().put("type", "string"))
@@ -387,23 +563,29 @@ object LinuxDesktop {
                 !cpuOk() -> DesktopPlan.UNSUPPORTED
                 _state.value.phase == Phase.INSTALLING -> "Installing ${distro().name}: ${_state.value.line}"
                 _state.value.phase == Phase.PAUSED -> "${distro().name} download paused by the user; start resumes it."
-                alive() -> "Running ${distro().name} at ${DesktopPlan.WIDTH}x${DesktopPlan.HEIGHT}, ${DesktopPlan.DEPTH}-bit colour, 127.0.0.1 only."
+                alive() -> "Running ${distro().name} at ${running.w}x${running.h}, ${running.depth}-bit colour, 127.0.0.1 only."
                 installed() -> "${distro().name} desktop installed, not running."
                 else -> "Not installed (start installs ${distro().name}: ${distro().sizeLine()})"
             }
             "open" -> { open(); "Opened the Desktop view." }
-            "screenshot" -> live(words) { screenshot(ctx) }?.let { shots += it; "Desktop screenshot attached in the next message (coordinates are in its pixels; the desktop is ${DesktopPlan.WIDTH}x${DesktopPlan.HEIGHT})." }
+            "screenshot" -> live(words) { screenshot(ctx) }?.let { shots += it; "Desktop screenshot attached in the next message (coordinates are in its pixels; the desktop is ${running.w}x${running.h})." }
                 ?: "Couldn't take a desktop screenshot."
             "click" -> {
                 val x = args.optInt("x", -1); val y = args.optInt("y", -1)
                 if (x < 0 || y < 0) "click needs x and y."
                 else if (!clickOk && !confirm("Let Blaze click in the Linux desktop?", "At $x, $y. You'll be asked once per session.").also { clickOk = it }) "The user said no."
-                else live(words, x, y) { Terminal.run(DesktopPlan.clickCmd(x, y, args.optInt("button", 1), args.optBoolean("double")), timeoutSec = 15, linux = true, distro = did()) }.let { "Clicked at $x, $y." }
+                else {
+                    // v0.34.0: screenshots are at most 1024 px, so a bigger screen's clicks are scaled back up.
+                    val k = maxOf(1.0, maxOf(running.w, running.h) / 1024.0)
+                    live(words, x, y) { Terminal.run(DesktopPlan.clickCmd((x * k).toInt(), (y * k).toInt(), args.optInt("button", 1), args.optBoolean("double")), timeoutSec = 15, linux = true, distro = did()) }.let { "Clicked at $x, $y." }
+                }
             }
             "type" -> {
                 val t = args.optString("text")
                 if (t.isBlank()) "type needs text."
                 else if (!confirm("Type in the Linux desktop?", "\u201c${t.take(120)}\u201d")) "The user said no."
+                // v0.34.0: a second, plain warning before anything that could delete files or break the Linux.
+                else if (DesktopExtras.dangerous(t) && !confirm(DesktopExtras.dangerTitle("Type it anyway?"), "\u201c${t.take(200)}\u201d")) "The user said no to the risky command."
                 else live(words) { Terminal.run(DesktopPlan.typeCmd(t), timeoutSec = 60, linux = true, distro = did()) }.let { "Typed ${t.length} characters." }
             }
             "key" -> {
@@ -416,9 +598,33 @@ object LinuxDesktop {
                 val app = args.optString("app")
                 if (app.isBlank()) "run needs app."
                 else if (!confirm("Open in the Linux desktop?", DesktopPlan.appCommand(app))) "The user said no."
+                else if (DesktopExtras.dangerous(DesktopPlan.appCommand(app)) && !confirm(DesktopExtras.dangerTitle("Run it anyway?"), DesktopPlan.appCommand(app).take(200))) "The user said no to the risky command."
                 else live(words) { Terminal.run(DesktopPlan.runCmd(app), timeoutSec = 15, linux = true, distro = did()) }.let { "Started ${DesktopPlan.appCommand(app)}. Take a screenshot to see it." }
             }
-            else -> "Unknown action. Use start, stop, status, screenshot, click, type, key, run or open."
+            "apps" -> apps(ctx).let { l -> if (l.isEmpty()) "No apps found (is the desktop installed?)." else l.joinToString("\n") { "${it.name}: ${it.exec}" } }
+            "launch" -> {
+                val n = args.optString("app").ifBlank { args.optString("text") }.trim()
+                val list = if (n.isBlank()) emptyList() else apps(ctx)
+                val e = list.firstOrNull { it.name.equals(n, true) } ?: list.firstOrNull { it.name.contains(n, true) }
+                if (n.isBlank()) "launch needs app (a name from action=apps)."
+                else if (e == null) "No app called \u201c$n\u201d. Call action=apps for the list."
+                else if (!confirm("Open ${e.name} in the Linux desktop?", e.exec)) "The user said no."
+                else live(words) { launch(e) }
+            }
+            "store" -> distro().let { d -> DesktopExtras.STORE.joinToString("\n") { s -> "${s.id}: ${s.name} \u2014 ${s.about}" + (if (DesktopExtras.packagesFor(s, d) == null) " (not on ${d.name}: ${DesktopExtras.whyNot(s, d)})" else "") } }
+            "install" -> {
+                val s = DesktopExtras.STORE.firstOrNull { it.id == args.optString("app").trim().lowercase() }
+                val pk = s?.let { DesktopExtras.packagesFor(it, distro()) }
+                when {
+                    s == null -> "Unknown store app. Call action=store for the ids."
+                    pk == null -> DesktopExtras.whyNot(s, distro())
+                    !confirm("Install ${s.name} in the Linux desktop?", "With ${distro().pm.tool}: " + pk.joinToString(" ")) -> "The user said no."
+                    else -> installApp(s)
+                }
+            }
+            "snapshot" -> if (!confirm("Save a snapshot of ${distro().name}?", "Everything installed and changed in the Linux, kept on this phone.")) "The user said no." else createSnapshot(ctx)
+            "snapshots" -> snapshots(ctx).let { l -> if (l.isEmpty()) "No snapshots yet." else l.joinToString("\n") { "${it.file} (${it.bytes / 1_000_000} MB)" } + "\nRestoring is done by the user on the Desktop page." }
+            else -> "Unknown action. Use start, stop, status, screenshot, click, type, key, run, open, apps, launch, store, install, snapshot or snapshots."
         }
     }
 

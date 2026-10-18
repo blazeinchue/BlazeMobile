@@ -57,6 +57,7 @@ import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -92,6 +93,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.graphics.Color
@@ -278,6 +281,9 @@ private fun LiveCamera(start: Mode, origin: Origin, attachTo: File?, chat: Strin
     var note by remember { mutableStateOf("") }
     var scanned by remember { mutableStateOf<Scanned?>(null) }
     var textCard by remember { mutableStateOf<Pair<File, String>?>(null) }
+    // v0.34.0: Night / HDR shots in Photo mode, and the 4-corner crop for documents without Google's scanner.
+    var shotKind by rememberSaveable { mutableStateOf("normal") }
+    var cropDoc by remember { mutableStateOf<File?>(null) }
     val analysisExec = remember { Executors.newSingleThreadExecutor() }
 
     // v0.30.x Camera Pro. One total zoom (hardware × digital, see CameraZoom), focus + exposure, grid, timer.
@@ -482,6 +488,11 @@ private fun LiveCamera(start: Mode, origin: Origin, attachTo: File?, chat: Strin
                     if (route == Route.CARD) textCard = out to words
                     else { BlazeCamera.deliver(ctx, m, origin, chat, asked, photo = out, ocr = words); onDone(true, null) }
                 }
+                m == Mode.DOCUMENT -> {
+                    withContext(Dispatchers.IO) { CameraSupport.normalize(out) }
+                    busy = false
+                    cropDoc = out   // drag the 4 corners onto the page, then it's flattened and sent
+                }
                 else -> {
                     withContext(Dispatchers.IO) { CameraSupport.normalize(out) }
                     busy = false
@@ -497,6 +508,13 @@ private fun LiveCamera(start: Mode, origin: Origin, attachTo: File?, chat: Strin
         val digital = CameraZoom.split(zoom, hwMax).digital
         val out = attachTo ?: CameraSupport.newPhoto(ctx).first
         out.parentFile?.mkdirs()
+        if (m == Mode.PHOTO && shotKind != "normal") {
+            scope.launch {
+                val ok = com.blaze.assistant.device.CameraStack.capture(ctx, controller, shotKind, out, lowRam, evLower, evUpper, evStep, ev) { note = it }
+                if (ok) handlePhoto(out, digital) else { busy = false; note = "The camera didn't give the frames for that shot. Try a normal photo." }
+            }
+            return
+        }
         controller.takePicture(ImageCapture.OutputFileOptions.Builder(out).build(), ContextCompat.getMainExecutor(ctx), object : ImageCapture.OnImageSavedCallback {
             override fun onImageSaved(r: ImageCapture.OutputFileResults) { handlePhoto(out, digital) }
             override fun onError(e: ImageCaptureException) {
@@ -579,6 +597,10 @@ private fun LiveCamera(start: Mode, origin: Origin, attachTo: File?, chat: Strin
                         }
                     }
                     .pointerInput(Unit) { detectTapGestures(onTap = { o -> tapFocus(o) }) })
+                if (m == Mode.PHOTO && !busy) Row(Modifier.align(Alignment.TopCenter).statusBarsPadding().padding(top = 64.dp),
+                    horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(6.dp)) {
+                    listOf("normal" to "Photo", "night" to "Night", "hdr" to "HDR").forEach { (k, l) -> CamPill(l, shotKind == k) { shotKind = k } }
+                }
             }
         },
         pro = pro, proActions = proActions,
@@ -602,6 +624,15 @@ private fun LiveCamera(start: Mode, origin: Origin, attachTo: File?, chat: Strin
     scanned?.takeIf { CameraModes.route(Mode.SCAN, origin) == Route.CARD }?.let { s ->
         ScanCard(s, onAsk = { BlazeCamera.deliver(ctx, Mode.SCAN, origin, chat, null, code = s.raw, routeOverride = Route.DRAFT); onDone(true, null) },
             onAgain = { scanned = null }, onDone = { onDone(true, null) })
+    }
+    cropDoc?.let { f ->
+        DocumentCrop(f, onCancel = { cropDoc = null }, onDone = { corners ->
+            scope.launch {
+                if (corners != null) com.blaze.assistant.device.CameraStack.cropDocument(f, corners)
+                cropDoc = null
+                BlazeCamera.deliver(ctx, Mode.DOCUMENT, origin, chat, asked, photo = f); onDone(true, null)
+            }
+        })
     }
     textCard?.let { (file, words) ->
         TextCard(words,
@@ -730,6 +761,18 @@ private fun TextCard(words: String, onTranslate: () -> Unit, onAsk: () -> Unit, 
         else SelectionContainer(Modifier.heightIn(max = 320.dp).verticalScroll(rememberScrollState())) {
             Text(words, style = TextStyle(fontFamily = Type.Sans, fontSize = 15.sp, lineHeight = 21.sp, color = c.ink))
         }
+        // v0.34.0: prices and sums the camera read, worked out.
+        val prices = remember(words) { com.blaze.assistant.device.CameraSmart.prices(words) }
+        val sums = remember(words) { com.blaze.assistant.device.CameraSmart.sums(words).mapNotNull { e -> Expr.eval(e)?.let { v -> e to v } }.take(4) }
+        if (prices.isNotEmpty()) {
+            Spacer(Modifier.height(8.dp))
+            val tot = com.blaze.assistant.device.CameraSmart.totals(prices).entries.joinToString(" + ") { (k, v) -> "$k ${"%,.2f".format(v)}" }
+            Text("${prices.size} price" + (if (prices.size == 1) "" else "s") + " \u00b7 total $tot", style = TextStyle(fontFamily = Type.Sans, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = c.ink))
+        }
+        sums.forEach { (e, v) ->
+            Text("$e = ${if (v == Math.floor(v) && kotlin.math.abs(v) < 1e15) v.toLong().toString() else "%.6g".format(v)}",
+                style = TextStyle(fontFamily = Type.Sans, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = c.ink))
+        }
         Spacer(Modifier.height(14.dp))
         CamChips(if (words.isBlank()) listOf("Try again" to onAgain, "Close" to onDone) else listOf(
             "Copy" to { camCopy(ctx, "Text", words) },
@@ -769,6 +812,20 @@ private fun ScanCard(s: Scanned, onAsk: () -> Unit, onAgain: () -> Unit, onDone:
     ResultSheet(when (s.kind) { CameraModes.CodeKind.URL -> "Link"; CameraModes.CodeKind.WIFI -> "Wi-Fi network"; CameraModes.CodeKind.CONTACT -> "Contact"
         CameraModes.CodeKind.PHONE -> "Phone number"; CameraModes.CodeKind.EMAIL -> "Email"; else -> "Code" }) {
         SelectionContainer { Text(shown, style = TextStyle(fontFamily = Type.Sans, fontSize = 15.sp, lineHeight = 21.sp, color = c.ink)) }
+        // v0.34.0: a product barcode (EAN / UPC) is looked up on Open Food Facts (free, open data).
+        if (com.blaze.assistant.device.CameraSmart.isProductCode(s.raw)) {
+            val product by androidx.compose.runtime.produceState<String?>(null, s.raw) {
+                value = "Looking up the product\u2026"
+                value = withContext(Dispatchers.IO) {
+                    try {
+                        val h = java.net.URL("https://world.openfoodfacts.org/api/v2/product/${s.raw.trim()}.json?fields=product_name,brands,quantity").openConnection() as java.net.HttpURLConnection
+                        h.connectTimeout = 8000; h.readTimeout = 10000; h.setRequestProperty("User-Agent", "Blaze/0.34 (Android)")
+                        com.blaze.assistant.device.CameraSmart.product(h.inputStream.bufferedReader().use { it.readText() }) ?: "Not in Open Food Facts yet."
+                    } catch (_: Exception) { "Couldn't look it up (no connection)." }
+                }
+            }
+            product?.let { Spacer(Modifier.height(6.dp)); Text(it, style = TextStyle(fontFamily = Type.Sans, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = c.ink)) }
+        }
         Spacer(Modifier.height(14.dp))
         CamChips(CameraModes.scanActions(s.kind).map { l -> l to { act(l) } } + ("Scan again" to onAgain))
     }
@@ -911,5 +968,68 @@ fun CameraModeBar(modes: List<Mode>, mode: Mode, onMode: (Mode) -> Unit) {
 private fun CamButton(icon: androidx.compose.ui.graphics.vector.ImageVector, desc: String, onClick: () -> Unit) {
     Box(Modifier.size(52.dp).clip(CircleShape).background(Color.Black.copy(alpha = 0.4f)).clickable(onClickLabel = desc, onClick = onClick), contentAlignment = Alignment.Center) {
         Icon(icon, contentDescription = desc, tint = Color.White, modifier = Modifier.size(26.dp))
+    }
+}
+
+
+/** v0.34.0 document crop: the photo with 4 draggable corners; Crop flattens the page inside them. */
+@Composable
+private fun DocumentCrop(f: File, onCancel: () -> Unit, onDone: (List<Pair<Float, Float>>?) -> Unit) {
+    val bmp by androidx.compose.runtime.produceState<android.graphics.Bitmap?>(null, f) {
+        value = withContext(Dispatchers.IO) {
+            val o = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            android.graphics.BitmapFactory.decodeFile(f.path, o)
+            var smp = 1; while (maxOf(o.outWidth, o.outHeight) / (smp * 2) >= 1400) smp *= 2
+            android.graphics.BitmapFactory.decodeFile(f.path, android.graphics.BitmapFactory.Options().apply { inSampleSize = smp })
+        }
+    }
+    val b = bmp
+    var corners by remember(b) { mutableStateOf(if (b != null) com.blaze.assistant.device.CameraSmart.defaultCorners(b.width, b.height) else emptyList()) }
+    androidx.compose.ui.window.Dialog(onDismissRequest = onCancel, properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false)) {
+        Column(Modifier.fillMaxSize().background(Color.Black).padding(12.dp)) {
+            Text("Drag the corners onto the page", style = TextStyle(fontFamily = Type.Sans, fontSize = 15.sp, color = Color.White))
+            Spacer(Modifier.height(8.dp))
+            Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                if (b != null) {
+                    val img = remember(b) { b.asImageBitmap() }
+                    Box(Modifier.fillMaxWidth().aspectRatio(b.width.toFloat() / b.height)) {
+                        androidx.compose.foundation.Image(img, "Document", Modifier.fillMaxSize())
+                        var drag by remember { mutableIntStateOf(-1) }
+                        androidx.compose.foundation.Canvas(Modifier.fillMaxSize().pointerInput(b) {
+                            val sx = b.width / size.width.toFloat(); val sy = b.height / size.height.toFloat()
+                            detectDragGestures(
+                                onDragStart = { o -> drag = com.blaze.assistant.device.CameraSmart.nearest(corners, o.x * sx, o.y * sy) },
+                                onDragEnd = { drag = -1 },
+                                onDrag = { ch, d ->
+                                    ch.consume()
+                                    val i = drag
+                                    if (i >= 0) corners = corners.mapIndexed { k, p -> if (k == i) ((p.first + d.x * sx).coerceIn(0f, b.width.toFloat()) to (p.second + d.y * sy).coerceIn(0f, b.height.toFloat())) else p }
+                                })
+                        }) {
+                            val kx = size.width / b.width; val ky = size.height / b.height
+                            val pts = corners.map { Offset(it.first * kx, it.second * ky) }
+                            if (pts.size == 4) {
+                                for (k in 0 until 4) drawLine(Color(0xFF4F8CFF), pts[k], pts[(k + 1) % 4], strokeWidth = 4f)
+                                pts.forEach { drawCircle(Color.White, 18f, it); drawCircle(Color(0xFF4F8CFF), 12f, it) }
+                            }
+                        }
+                    }
+                } else Text("Opening\u2026", style = TextStyle(color = Color.White))
+            }
+            Spacer(Modifier.height(10.dp))
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(8.dp, Alignment.End)) {
+                CamPill("Use as is", false) { onDone(null) }
+                CamPill("Crop page", true) {
+                    val bb = b
+                    if (bb == null) onDone(null) else {
+                        // Corners are in the preview bitmap's pixels: scale them to the full photo.
+                        val o = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                        android.graphics.BitmapFactory.decodeFile(f.path, o)
+                        val k = o.outWidth.toFloat() / bb.width
+                        onDone(corners.map { (x, y) -> x * k to y * k })
+                    }
+                }
+            }
+        }
     }
 }

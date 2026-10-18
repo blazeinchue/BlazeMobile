@@ -38,7 +38,8 @@ object Distros {
             status.value = if (resumed) "Resuming ${d.name}…" else "Downloading ${d.name}…"
             try {
                 // v0.33.5: resumes from .part (filesDir), and Stop (the Desktop page / notification) pauses it.
-                Fetch.download(listOf(url), txz, "", progress = { got, total, retry ->
+                // v0.34.0: every rootfs is SHA-256 checked (TermLogic.CHECKSUMS); a bad download is thrown away and retried.
+                Fetch.download(listOf(url), txz, TermLogic.sha256(d, cpu.orEmpty()), progress = { got, total, retry ->
                     status.value = retry ?: Fetch.mbLine(d.name, got, total, resumed)
                 }, sleep = stop.sleep, open = stop::open, cancelled = stop.cancelled)
             } catch (e: Exception) {

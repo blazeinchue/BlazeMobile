@@ -18,13 +18,15 @@ object DesktopInstall {
 
     private val network = Regex("(?i)temporary error|network error|dns lookup|could not connect|connection (refused|reset|timed out|closed)|" +
         "timed? ?out|i/o error|\\bio error|unable to fetch|network is unreachable|no route to host|\\btls\\b|\\bssl\\b|unexpected end of file|broken pipe|" +
-        "bad archive|untrusted signature|\\beof\\b|host is down|software caused connection abort|resolv")
+        "bad archive|untrusted signature|\\beof\\b|host is down|software caused connection abort|resolv|failed to fetch|failed retrieving file|" +
+        "curl error|failed to download|cannot download|could not download|connection failed|hash sum mismatch|download timeout")
 
     /** What kind of failure an apk log tail shows. */
     fun classify(log: String): Fail = when {
         Regex("(?i)no space left|enospc|disk full").containsMatchIn(log) -> Fail.SPACE
         network.containsMatchIn(log) -> Fail.NETWORK
-        Regex("(?i)unable to select packages|no such package|breaks: world|not found").containsMatchIn(log) -> Fail.MISSING
+        Regex("(?i)unable to select packages|no such package|breaks: world|not found|unable to locate package|has no installation candidate|" +
+            "no match for argument|unable to find a match|error: no package").containsMatchIn(log) -> Fail.MISSING
         else -> Fail.OTHER
     }
 
@@ -69,8 +71,13 @@ object DesktopInstall {
      */
     fun run(exec: (String, (String) -> Unit) -> Result, status: (Int?, String) -> Unit, sleep: (Long) -> Unit,
             mirrors: List<String> = AlpineNet.MIRRORS, startMirror: Int = 0, tries: Int = TRIES, onMirror: (Int) -> Unit = {},
-            prefetch: ((mirror: Int, pkgs: List<String>, update: Boolean) -> List<DesktopPrefetch.Pkg>?)? = null): String? {
-        val steps: List<List<String>> = listOf(emptyList<String>()) + DesktopPlan.BATCHES
+            prefetch: ((mirror: Int, pkgs: List<String>, update: Boolean) -> List<DesktopPrefetch.Pkg>?)? = null,
+            distro: DesktopDistro.Info = DesktopDistro.ALPINE, stopped: () -> Boolean = { false }): String? {
+        // v0.33.5: other Linuxes use their own package manager and mirror list (no Alpine mirrors, no prefetch).
+        val alpine = distro.pm == DesktopDistro.Pm.APK
+        @Suppress("NAME_SHADOWING") val mirrors = if (alpine) mirrors else listOf("")
+        @Suppress("NAME_SHADOWING") val prefetch = if (alpine) prefetch else null
+        val steps: List<List<String>> = listOf(emptyList<String>()) + distro.batches
         val n = steps.size + 1
         var mirror = startMirror.coerceIn(0, (mirrors.size - 1).coerceAtLeast(0))
         var failsHere = 0
@@ -78,18 +85,26 @@ object DesktopInstall {
         for ((i, pkgs) in steps.withIndex()) {
             var attempt = 1
             while (true) {
+                if (stopped()) return DesktopFlow.STOPPED_MARK
                 status(pct(i, n, 0), if (pkgs.isEmpty()) "Checking what to download\u2026" else "Downloading " + pkgs.joinToString(", ") + "\u2026")
                 // v0.33.3: Blaze downloads the batch's packages itself (resumable) once the package list is fresh.
                 // null = the prefetch couldn't run (old path); a list (even empty) = the package list is fresh now.
                 val pre = if (pkgs.isNotEmpty() && prefetch != null) try { prefetch(mirror, pkgs, needUpdate) } catch (_: Exception) { null } else null
                 val staged = pre.orEmpty()
-                val r = exec(DesktopPlan.stepScript(mirrors[mirror], pkgs, update = (needUpdate && pre == null) || pkgs.isEmpty(), staged = staged)) { line ->
-                    DesktopPlan.progressLine(line)?.let { (p, words) -> if (p != null && p < 100) status(pct(i, n, p), words) }
+                if (stopped()) return DesktopFlow.STOPPED_MARK
+                val upd = (needUpdate && pre == null) || pkgs.isEmpty()
+                val script = if (alpine) DesktopPlan.stepScript(mirrors[mirror], pkgs, update = upd, staged = staged)
+                    else DesktopDistro.stepScript(distro, pkgs, update = upd)
+                val r = exec(script) { line ->
+                    DesktopDistro.progressLine(distro.pm, line)?.let { (p, words) ->
+                        if (p != null && p < 100) status(pct(i, n, p), words) else if (p == null && !alpine) status(null, words)
+                    }
                 }
+                if (stopped()) return DesktopFlow.STOPPED_MARK
                 if (r.code == 0 && "BLAZE_STEP_OK" in r.tail) { needUpdate = false; failsHere = 0; break }
                 val f = classify(r.tail)
                 // v0.33.4: a package that isn't on the mirror never appears by retrying; skip optional extras after one fresh-list retry.
-                if (f == Fail.MISSING && pkgs in DesktopPlan.OPTIONAL && attempt >= 2) { needUpdate = false; break }
+                if (f == Fail.MISSING && pkgs in distro.optional && attempt >= 2) { needUpdate = false; break }
                 if (f == Fail.MISSING && attempt >= 3) return failLine(f, r.tail)
                 if (f == Fail.SPACE || attempt >= tries) return failLine(f, r.tail)
                 attempt++
@@ -98,10 +113,12 @@ object DesktopInstall {
                 val switched = m != mirror
                 mirror = m; failsHere = c; needUpdate = true
                 if (switched) onMirror(mirror)
-                status(null, retryLine(f, attempt, tries, if (switched) AlpineNet.host(mirrors[mirror]) else null))
+                status(null, retryLine(f, attempt, tries, if (switched && alpine) AlpineNet.host(mirrors[mirror]) else null))
                 sleep(backoffSec(attempt) * 1000L)
+                if (stopped()) return DesktopFlow.STOPPED_MARK
             }
         }
+        if (stopped()) return DesktopFlow.STOPPED_MARK
         status(pct(n - 1, n, 0), "Finishing\u2026")
         val r = exec(DesktopPlan.FINISH_SCRIPT) { }
         return if (r.code == 0 && "BLAZE_DESKTOP_INSTALLED" in r.tail) null else failLine(classify(r.tail), r.tail)

@@ -160,7 +160,7 @@ object Terminal {
     val mode: MutableStateFlow<String> get() = active.value.mode
 
     fun newSession(m: String = "phone"): Session {
-        val s = Session(nextSession++, if (m == "linux" && Linux.installed()) "linux" else "phone")
+        val s = Session(nextSession++, if (m == "linux" && Distros.installed(defaultDistro())) "linux" else "phone")
         sessions.value = sessions.value + s
         active.value = s
         startShell()
@@ -185,12 +185,13 @@ object Terminal {
                 if (sess.shell?.isAlive == true) return@launch
                 try {
                     setup()
-                    val linux = sess.mode.value == "linux" && Linux.installed()
-                    val pb = if (linux) ProcessBuilder(Linux.command(null)).also { it.environment().putAll(env()); it.environment().putAll(Linux.env()) }
+                    val dist = defaultDistro()
+                    val linux = sess.mode.value == "linux" && Distros.installed(dist)
+                    val pb = if (linux) ProcessBuilder(Linux.command(null, distro = dist)).also { it.environment().putAll(env()); it.environment().putAll(Linux.env()) }
                              else ProcessBuilder("/system/bin/sh").also { it.environment().putAll(env()) }
                     val p = pb.directory(home()).redirectErrorStream(true).start()
                     sess.shell = p
-                    sess.append(if (linux) "[Alpine Linux — apk add <package> to install software]\n" else "[phone shell ready]\n")
+                    sess.append(if (linux) "[${TermLogic.distro(dist)?.name ?: "Linux"} — ${installHint(dist)} to install software]\n" else "[phone shell ready]\n")
                     launch {
                         val buf = CharArray(4096)
                         val r = p.inputStream.bufferedReader()
@@ -204,14 +205,14 @@ object Terminal {
         }
     }
 
-    private fun banner(s: Session) = "Blaze terminal · ${if (s.mode.value == "linux") "Alpine Linux" else "sh + BusyBox"} · home is ~\n"
+    private fun banner(s: Session) = "Blaze terminal · ${if (s.mode.value == "linux") (TermLogic.distro(defaultDistro())?.name ?: "Linux") else "sh + BusyBox"} · home is ~\n"
 
     fun switchMode(m: String) {
         val s = active.value
         if (s.mode.value == m) return
         s.mode.value = m
         s.shell?.destroy(); s.shell = null
-        s.append("\n— switching to ${if (m == "linux") "Alpine Linux" else "phone shell"} —\n")
+        s.append("\n— switching to ${if (m == "linux") (TermLogic.distro(defaultDistro())?.name ?: "Linux") else "phone shell"} —\n")
         startShell(s)
     }
 
@@ -275,11 +276,19 @@ object Terminal {
         return "[ -f \"$envFile\" ] && . \"$envFile\"; cd ${q(cwd)} 2>/dev/null\n$cmd\n__rc=\$?; echo \"$MARK\$(pwd)\"; exit \$__rc"
     }
 
-    suspend fun run(cmd: String, timeoutSec: Int = 60, linux: Boolean = false): String = withContext(Dispatchers.IO) {
+    /** v0.33.5: the Linux a `linux=true` command runs in when the caller doesn't name one: the user's chosen desktop Linux (once installed), else Alpine. */
+    fun defaultDistro(): String = try { com.blaze.assistant.desktop.LinuxDesktop.shellDistro() } catch (_: Throwable) { "alpine" }
+
+    /** The package manager hint for [distro] ("apt install <package>"). */
+    fun installHint(distro: String): String = com.blaze.assistant.desktop.DesktopDistro.installHint(com.blaze.assistant.desktop.DesktopDistro.of(distro).pm)
+
+    suspend fun run(cmd: String, timeoutSec: Int = 60, linux: Boolean = false, distro: String? = null): String = withContext(Dispatchers.IO) {
         setup()
-        if (linux && !Linux.installed()) return@withContext "Linux isn't installed yet. Call linux_install (one-time ~3.5 MB download), or use run_code which sets it up for you."
+        val dist = if (linux) (distro ?: defaultDistro()) else "alpine"
+        if (linux && !Distros.installed(dist)) return@withContext if (dist == "alpine") "Linux isn't installed yet. Call linux_install (one-time ~3.5 MB download), or use run_code which sets it up for you."
+            else "${TermLogic.distro(dist)?.name ?: dist} isn't installed yet. Start the Linux desktop once (Desktop page), or install it from the Terminal's + menu."
         val full = wrap(cmd, linux)
-        val p = try { if (linux) ProcessBuilder(Linux.command(full)).directory(home()).redirectErrorStream(true)
+        val p = try { if (linux) ProcessBuilder(Linux.command(full, distro = dist)).directory(home()).redirectErrorStream(true)
                 .also { it.environment().putAll(env()); it.environment().putAll(Linux.env()) }.start() else builder(full).start() } catch (e: Exception) { return@withContext "Error: ${e.message}" }
         try { p.outputStream.close() } catch (_: Exception) { }   // no stdin: commands that wait for input fail fast instead of hanging
         val out = StringBuilder()
@@ -294,14 +303,15 @@ object Terminal {
         val text = if (raw.length > 8000) raw.take(2000) + "\n…[${raw.length - 8000} chars cut; redirect to a file and use file_read/file_search]…\n" + raw.takeLast(6000) else raw
         val hint = when {
             code == 127 && !linux -> "\n[hint: command not found in the phone shell. For python/node/git/curl/gcc use linux=true (apk add <pkg>) or run_code.]"
-            code == 127 && linux -> "\n[hint: not installed in Linux; apk add <package> first (apk search <name> to find it).]"
+            code == 127 && linux && dist == "alpine" -> "\n[hint: not installed in Linux; apk add <package> first (apk search <name> to find it).]"
+            code == 127 && linux -> "\n[hint: not installed in ${TermLogic.distro(dist)?.name ?: dist}; ${installHint(dist)} first.]"
             code != 0 && Regex("(?i)permission denied").containsMatchIn(raw) -> "\n[hint: Android blocks that path for apps; work inside ~ or /sdcard.]"
             code != 0 && Regex("(?i)no space left").containsMatchIn(raw) -> "\n[hint: phone storage is full.]"
             else -> ""
         }
         val where = if (linux) linuxCwd else agentCwd().absolutePath.replace(home().absolutePath, "~")
         val result = "exit $code · cwd $where\n$text".trimEnd() + hint
-        logAgent("${if (linux) "linux" else "sh"} $ ${cmd.take(300)}", result)
+        logAgent("${if (linux) (if (dist == "alpine") "linux" else dist) else "sh"} $ ${cmd.take(300)}", result)
         result
     }
 
@@ -323,11 +333,12 @@ object Terminal {
     private val jobs = LinkedHashMap<Int, Job>()
     private var nextJob = 1
 
-    fun startJob(cmd: String, linux: Boolean = false, maxMinutes: Int = 0): String {
+    fun startJob(cmd: String, linux: Boolean = false, maxMinutes: Int = 0, distro: String? = null): String {
         setup()
-        if (linux && !Linux.installed()) return "Linux isn't installed yet (linux_install)."
+        val dist = if (linux) (distro ?: defaultDistro()) else "alpine"
+        if (linux && !Distros.installed(dist)) return if (dist == "alpine") "Linux isn't installed yet (linux_install)." else "${TermLogic.distro(dist)?.name ?: dist} isn't installed yet."
         val wrapped = (if (linux) "[ -f /root/phone/.blaze_env ] && . /root/phone/.blaze_env; cd ${q(linuxCwd)} 2>/dev/null\n" else "[ -f \"\$HOME/.blaze_env\" ] && . \"\$HOME/.blaze_env\"; cd ${q(agentCwd().absolutePath)} 2>/dev/null\n") + cmd
-        val p = try { if (linux) ProcessBuilder(Linux.command(wrapped)).directory(home()).redirectErrorStream(true)
+        val p = try { if (linux) ProcessBuilder(Linux.command(wrapped, distro = dist)).directory(home()).redirectErrorStream(true)
                 .also { it.environment().putAll(env()); it.environment().putAll(Linux.env()) }.start() else builder(wrapped).start() } catch (e: Exception) { return "Error: ${e.message}" }
         val jid = nextJob++
         val pid = com.blaze.assistant.agent.Processes.register("job", cmd.take(50), jid.toString(), props = org.json.JSONObject().put("command", cmd).put("max_minutes", maxMinutes))
@@ -442,10 +453,17 @@ object Terminal {
         JSONObject().put("name", name).put("description", desc).put("parameters", JSONObject().put("type", "object").put("properties", props).put("required", JSONArray(req))))
     private fun p(t: String, d: String) = JSONObject().put("type", t).put("description", d)
 
+    /** v0.33.5: the linux=true description names the Linux it really runs in and its package manager. */
+    private fun linuxParam(): String {
+        val d = defaultDistro()
+        return if (d == "alpine") "Run inside Blaze's Alpine Linux (apk add python3/nodejs/git/openjdk17…) instead of the phone shell"
+        else "Run inside Blaze's ${TermLogic.distro(d)?.name ?: d} (the user's chosen Linux; ${installHint(d)}, e.g. python3, nodejs, git) instead of the phone shell"
+    }
+
     fun tools(ctx: Context): List<JSONObject> = buildList {
         add(fn("run_shell", "Run a shell command on the phone (Android sh + BusyBox: ls, cat, grep, sed, awk, wget, curl-less http via wget, tar, unzip, vi, nc, httpd, find, ps, top, df, du...). Working dir is Blaze's home (~). Set background=true for servers, downloads, scraping or anything over ~30 s: it keeps running if Blaze is closed and the user gets a notification when it finishes or fails (optionally limit it with max_minutes). Returns exit code, current folder and output. The shell remembers cd between calls; put exports in ~/.blaze_env to keep them. For writing files use file_write, not echo/heredocs.",
             JSONObject().put("command", p("string", "Shell command")).put("timeout_seconds", p("integer", "Max seconds (default 60)")).put("background", p("boolean", "Run as a background job")).put("max_minutes", p("integer", "Time budget for a background job; 0 = none"))
-            .put("linux", p("boolean", "Run inside Blaze's Alpine Linux (apk add python3/nodejs/git/openjdk17…) instead of the phone shell")), listOf("command")))
+            .put("linux", p("boolean", linuxParam())), listOf("command")))
         add(fn("linux_install", "Download and set up Alpine Linux inside Blaze (one time, ~3.5 MB, no root).", JSONObject(), emptyList()))
         add(fn("terminal_jobs", "Background shell jobs. No id: list them with a short tail of output. With id: that job's latest output (lines, default 80). Type into one with job_input, stop with terminal_stop.",
             JSONObject().put("id", p("integer", "Job number for its full output")).put("lines", p("integer", "Last N lines, default 80")), emptyList()))

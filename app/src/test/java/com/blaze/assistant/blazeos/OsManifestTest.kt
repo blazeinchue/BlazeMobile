@@ -32,6 +32,10 @@ class OsManifestTest {
         assertEquals("clock", ok("""{"id":"blazeos.clock","name":"Clock","entry":{"type":"builtin","key":"clock"}}""").entry.key)
         val l = ok("""{"id":"linux.xeyes","name":"Eyes","entry":{"type":"linux","command":"xeyes -geometry 300x200","packages":["xeyes"]}}""")
         assertEquals(OsEntry(OsManifest.LINUX, command = "xeyes -geometry 300x200", packages = listOf("xeyes")), l.entry)
+        // v0.33.5: per-Linux package names; bad ids and names are dropped.
+        val d = ok("""{"id":"linux.xeyes","name":"Eyes","entry":{"type":"linux","command":"xeyes","packages":["xeyes"],"distro_packages":{"fedora":["xeyes","Bad;rm"],"ubuntu":["x11-apps"],"BAD ID":["x"]}}}""")
+        assertEquals(mapOf("fedora" to listOf("xeyes"), "ubuntu" to listOf("x11-apps")), d.entry.distroPackages)
+        assertEquals(d.entry.distroPackages, (OsManifest.parse(OsManifest.toJson(d).toString()) as OsManifest.Parsed.Ok).m.entry.distroPackages)
         // A web entry with no path opens index.html.
         assertEquals("index.html", ok("""{"id":"a.b","name":"X","entry":{"type":"web"}}""").entry.path)
         assertEquals("1.0", ok("""{"id":"a.b","name":"X","entry":{"type":"web"}}""").version)

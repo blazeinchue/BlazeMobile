@@ -64,6 +64,10 @@ object TermLogic {
     /** The default for a new tab: the last one used if it's still there, else the first available. */
     fun pick(last: String?, installedIds: Set<String>): Env = envs(installedIds).let { l -> l.firstOrNull { it.id == last } ?: l.first() }
 
+    /** v0.33.5: a new tab opens in the Linux chosen on the Desktop page when it's one besides Alpine and installed; otherwise as [pick]. */
+    fun pick(last: String?, installedIds: Set<String>, chosen: String?): Env =
+        if (chosen != null && chosen != "alpine" && chosen in installedIds) envs(installedIds).first { it.id == chosen } else pick(last, installedIds)
+
     /** pax extended header records: "<len> key=value\n" … */
     fun pax(body: String): List<Pair<String, String>> {
         val out = mutableListOf<Pair<String, String>>()

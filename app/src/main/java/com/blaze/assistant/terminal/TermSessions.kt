@@ -96,7 +96,7 @@ object TermSessions {
     fun open(ctx: Context, env: TermLogic.Env? = null): Tab {
         app = ctx.applicationContext
         Terminal.init(app); Terminal.setup()
-        val e = env ?: TermLogic.pick(lastEnv, Distros.installedIds())
+        val e = env ?: TermLogic.pick(lastEnv, Distros.installedIds(), Terminal.defaultDistro())
         lastEnv = e.id
         if (e.id != "phone") Linux.selfTest(e.id)      // v0.30.2: once per build, in the background
         val tab = spawn(e)

@@ -172,7 +172,7 @@ fun OsLinuxApp(inst: OsInstalled) {
         OsGlyphIcon(m.icon, 96.dp)
         Spacer(Modifier.height(14.dp))
         Text(m.name, style = osText(look, 24f, FontWeight.SemiBold))
-        Text("A Linux app. It opens in Blaze's Linux desktop (${m.entry.command}).", style = osText(look, 14f, color = look.sub))
+        Text("A Linux app. It opens in Blaze's Linux desktop (${com.blaze.assistant.desktop.LinuxDesktop.distro().name}, ${m.entry.command}).", style = osText(look, 14f, color = look.sub))
         Spacer(Modifier.height(24.dp))
         if (!installed) {
             Text("The Linux desktop isn't set up yet. Set it up once in Desktop, then come back.", style = osText(look, 14f))
@@ -184,12 +184,15 @@ fun OsLinuxApp(inst: OsInstalled) {
                 try {
                     val d = com.blaze.assistant.desktop.LinuxDesktop
                     if (!d.alive()) { step = "Starting the Linux desktop…"; d.start(ctx) }
-                    if (m.entry.packages.isNotEmpty()) {
-                        step = "Getting ${m.entry.packages.joinToString(", ")}…"
-                        com.blaze.assistant.terminal.Terminal.run("apk add --no-cache " + m.entry.packages.joinToString(" "), timeoutSec = 300, linux = true)
+                    // v0.33.5: installed with the chosen Linux's own package manager (apk / apt / pacman / dnf), in that Linux.
+                    val dist = d.distro()
+                    val pkgs = com.blaze.assistant.desktop.DesktopDistro.mapPackages(dist, m.entry.packages, m.entry.distroPackages)
+                    if (pkgs.isNotEmpty()) {
+                        step = "Getting ${pkgs.joinToString(", ")} (${dist.pm.tool})…"
+                        com.blaze.assistant.terminal.Terminal.run(com.blaze.assistant.desktop.DesktopDistro.appInstallScript(dist, pkgs), timeoutSec = 600, linux = true, distro = dist.id)
                     }
                     step = "Opening…"
-                    com.blaze.assistant.terminal.Terminal.run(com.blaze.assistant.desktop.DesktopPlan.runCmd(m.entry.command), timeoutSec = 15, linux = true)
+                    com.blaze.assistant.terminal.Terminal.run(com.blaze.assistant.desktop.DesktopPlan.runCmd(m.entry.command), timeoutSec = 15, linux = true, distro = dist.id)
                     d.viewerRequest.value = true
                     step = ""
                     BlazeOs.launch("blaze:linux")

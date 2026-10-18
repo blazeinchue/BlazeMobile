@@ -59,6 +59,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import com.blaze.assistant.desktop.DesktopDistro
+import com.blaze.assistant.desktop.DesktopFlow
 import com.blaze.assistant.desktop.DesktopPlan
 import com.blaze.assistant.desktop.DesktopPlan.Phase
 import com.blaze.assistant.desktop.LinuxDesktop
@@ -89,6 +91,18 @@ fun LinuxDesktopPage(preview: LinuxDesktop.State? = null) {
         if (preview == null && wantViewer) { if (st.phase == Phase.RUNNING) viewing = true; LinuxDesktop.viewerRequest.value = false }
     }
 
+    // v0.33.5: the chosen Linux (Alpine unless picked), and a paused download shown as paused after Blaze restarts.
+    LaunchedEffect(Unit) { if (preview == null) LinuxDesktop.refresh() }
+    val chosenFlow by LinuxDesktop.distroId.collectAsState()
+    val initialDistro = remember { if (preview != null) DesktopDistro.DEFAULT else LinuxDesktop.distro().id }
+    val distro = DesktopDistro.of(if (preview != null) DesktopDistro.DEFAULT else chosenFlow.ifBlank { initialDistro })
+    var kept by remember { mutableStateOf(0L) }
+    var note by remember { mutableStateOf("") }
+    LaunchedEffect(st.phase, distro.id) {
+        if (preview == null) kept = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { LinuxDesktop.keptBytes() }
+    }
+    val paused = st.phase == Phase.PAUSED
+
     PageHead("Desktop", "Linux desktop", "A real Linux desktop (XFCE) running inside Blaze's own Linux on this phone. Nothing leaves the phone; Blaze can work in it too, always after asking.")
     Spacer(Modifier.height(14.dp))
     if (!supported || st.phase == Phase.UNSUPPORTED) {
@@ -97,44 +111,101 @@ fun LinuxDesktopPage(preview: LinuxDesktop.State? = null) {
     }
     BlazeCard(accent = st.phase == Phase.RUNNING) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Box(Modifier.size(8.dp).clip(BlazeShapes.pill).background(when (st.phase) { Phase.RUNNING -> c.accent; Phase.ERROR, Phase.KILLED -> PageGlass.error; else -> c.weak }))
+            Box(Modifier.size(8.dp).clip(BlazeShapes.pill).background(when (st.phase) { Phase.RUNNING -> c.accent; Phase.PAUSED -> c.sub; Phase.ERROR, Phase.KILLED -> PageGlass.error; else -> c.weak }))
             Spacer(Modifier.width(10.dp))
             Text(when {
                 killed -> "Closed by Android"
+                paused -> st.line.ifBlank { DesktopFlow.PAUSED_LINE }
                 st.phase == Phase.IDLE || st.phase == Phase.STOPPED -> if (preview == null && !LinuxDesktop.installed()) "Not installed yet" else "Ready"
                 else -> st.line.ifBlank { st.phase.name.lowercase().sentence() }
             }, style = TextStyle(fontFamily = Type.Display, fontSize = 16.sp, color = c.ink))
         }
-        if (st.phase == Phase.INSTALLING || st.phase == Phase.STARTING) {
+        if (st.phase == Phase.INSTALLING || st.phase == Phase.STARTING || (paused && st.pct != null)) {
             Spacer(Modifier.height(10.dp))
             BrandProgress(st.pct ?: 50)
         }
         Spacer(Modifier.height(8.dp))
         Text(when {
             killed -> DesktopPlan.KILLED_NOTE
+            paused -> DesktopFlow.pausedLine(kept, distro.name)
             st.phase == Phase.ERROR -> st.error
-            st.phase == Phase.RUNNING -> "${DesktopPlan.WIDTH}\u00d7${DesktopPlan.HEIGHT}, 16-bit colour, only reachable from this phone."
+            st.phase == Phase.RUNNING -> "${distro.name} \u00b7 ${DesktopPlan.WIDTH}\u00d7${DesktopPlan.HEIGHT}, 16-bit colour, only reachable from this phone."
+            st.phase == Phase.INSTALLING -> "${distro.name} \u00b7 You can leave this page or turn the screen off. Stop download keeps what's downloaded."
             preview == null && LinuxDesktop.installed() -> "Light defaults for phones with 3\u20134 GB of memory. Stop it when you're done to free memory."
-            else -> "First start installs it: " + DesktopPlan.sizeLine()
+            else -> "First start installs ${distro.name}: " + distro.sizeLine()
         }, style = TextStyle(fontFamily = Type.Sans, fontSize = 13.sp, lineHeight = 19.sp, color = c.sub))
     }
     Spacer(Modifier.height(14.dp))
     val busy = st.phase == Phase.INSTALLING || st.phase == Phase.STARTING || st.phase == Phase.STOPPING
+    val stopping = paused && st.line != DesktopFlow.PAUSED_LINE   // "Stopping the download…" until the install has really let go
+    val start = {
+        // v0.25.5: runs in Blaze's own scope, so leaving this page doesn't cancel a download.
+        note = ""
+        val job = LinuxDesktop.startAsync(ctx)
+        scope.launch { if (job.await().startsWith("The desktop is running")) viewing = true }
+    }
     Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-        if (st.phase == Phase.RUNNING) {
-            BlazeButton("Open full screen", Modifier.weight(1f)) { viewing = true }
-            BlazeButton("Stop", kind = BtnKind.SECONDARY) { scope.launch { LinuxDesktop.stop() } }
-        } else BlazeButton(if (killed) "Resume" else if (busy) "Working\u2026" else "Start", Modifier.weight(1f), enabled = !busy) {
-            // v0.25.5: runs in Blaze's own scope, so leaving this page doesn't cancel a download.
-            val job = LinuxDesktop.startAsync(ctx)
-            scope.launch { if (job.await().startsWith("The desktop is running")) viewing = true }
+        when {
+            st.phase == Phase.RUNNING -> {
+                BlazeButton("Open full screen", Modifier.weight(1f)) { viewing = true }
+                BlazeButton("Stop", kind = BtnKind.SECONDARY) { scope.launch { LinuxDesktop.stop() } }
+            }
+            // v0.33.5: the old greyed-out "Working…" is now a real Stop: it pauses the download and keeps what's downloaded.
+            st.phase == Phase.INSTALLING -> BlazeButton(DesktopFlow.mainLabel(st.phase, false), Modifier.weight(1f), kind = BtnKind.SECONDARY) {
+                LinuxDesktop.stopInstall(ctx)
+            }
+            st.phase == Phase.STARTING || st.phase == Phase.STOPPING -> BlazeButton("Working\u2026", Modifier.weight(1f), enabled = false) { }
+            else -> BlazeButton(DesktopFlow.mainLabel(st.phase, killed), Modifier.weight(1f), enabled = !stopping) { start() }
         }
+    }
+    val desktopInstalled = remember(st.phase, distro.id) { preview == null && LinuxDesktop.installed() }
+    if (preview == null && DesktopFlow.canRemove(st.phase, kept, installed = desktopInstalled) && !stopping) {
+        Spacer(Modifier.height(10.dp))
+        BlazeButton("Remove downloaded files", Modifier.fillMaxWidth(), kind = BtnKind.GHOST) {
+            scope.launch { note = LinuxDesktop.removeDownloads(); kept = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { LinuxDesktop.keptBytes() } }
+        }
+    }
+    if (note.isNotBlank()) {
+        Spacer(Modifier.height(8.dp))
+        Text(note, style = TextStyle(fontFamily = Type.Sans, fontSize = 13.sp, lineHeight = 19.sp, color = c.sub))
+    }
+    Spacer(Modifier.height(18.dp))
+    // v0.33.5: which Linux the desktop runs in. Alpine is the default and the light choice for a Galaxy A12.
+    val canSwitch = preview == null && DesktopFlow.canSwitch(st.phase)
+    GroupHead("Linux", if (canSwitch) "The desktop, the Terminal and Linux apps use this one." else "Stop the desktop to switch.")
+    val options = remember(preview == null) {
+        if (preview != null) DesktopDistro.ALL
+        else DesktopDistro.available(try { com.blaze.assistant.terminal.TermLogic.cpu(android.os.Build.SUPPORTED_ABIS?.firstOrNull()) } catch (_: Throwable) { null })
+    }
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        options.forEach { d -> DistroCard(d, picked = d.id == distro.id, enabled = canSwitch) { if (LinuxDesktop.setDistro(d.id)) note = "" } }
     }
     Spacer(Modifier.height(18.dp))
     GroupHead("How it works", "")
     Text("Tap to click, two fingers to right-click or scroll, pinch to zoom and drag to pan when zoomed. The keyboard button types; the arrow turns it sideways.",
         style = TextStyle(fontFamily = Type.Sans, fontSize = 13.sp, lineHeight = 19.sp, color = c.sub))
     if (viewing && st.phase == Phase.RUNNING && preview == null) DesktopViewer(onClose = { viewing = false })
+}
+
+/** v0.33.5: one Linux choice: name, package manager, size, and "Recommended for the A12" on Alpine. */
+@Composable
+private fun DistroCard(d: DesktopDistro.Info, picked: Boolean, enabled: Boolean, onPick: () -> Unit) {
+    val c = LocalBlaze.current.mono
+    BlazeCard(accent = picked, onClick = if (enabled && !picked) onPick else null) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Box(Modifier.size(16.dp).clip(CircleShape).border(1.5.dp, if (picked) c.accent else c.weak, CircleShape), contentAlignment = Alignment.Center) {
+                if (picked) Box(Modifier.size(8.dp).clip(CircleShape).background(c.accent))
+            }
+            Spacer(Modifier.width(10.dp))
+            Text(d.name, style = TextStyle(fontFamily = Type.Display, fontSize = 16.sp, color = if (enabled || picked) c.ink else c.sub))
+            Spacer(Modifier.width(8.dp))
+            if (d.recommended) Tag("Recommended for the A12", on = true)
+            Spacer(Modifier.weight(1f))
+            Text(d.pm.tool, style = TextStyle(fontFamily = Type.Sans, fontSize = 12.sp, color = c.sub))
+        }
+        Spacer(Modifier.height(6.dp))
+        Text(d.blurb + " About ${d.downloadMb} MB to download.", style = TextStyle(fontFamily = Type.Sans, fontSize = 13.sp, lineHeight = 19.sp, color = c.sub))
+    }
 }
 
 /** Full-screen viewer. Closing it leaves the desktop running; Stop ends it. */

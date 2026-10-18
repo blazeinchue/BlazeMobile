@@ -30,7 +30,7 @@ object Linux {
 
     private fun arch() = AlpineNet.arch(Build.SUPPORTED_ABIS.firstOrNull())
 
-    suspend fun install(): String = withContext(Dispatchers.IO) {
+    suspend fun install(stop: StopToken = StopToken()): String = withContext(Dispatchers.IO) {
         if (!supported()) return@withContext "This phone's CPU isn't supported for Linux."
         if (installing.value) {   // another caller (e.g. the setup prefetch) is on it: wait for it instead of skipping
             var waited = 0
@@ -57,8 +57,9 @@ object Linux {
                 try {
                     Fetch.download(AlpineNet.rootfsUrls(a), tgz, sha, progress = { got, total, retry ->
                         status.value = retry ?: Fetch.mbLine("Alpine Linux", got, total, resumed)
-                    })
+                    }, sleep = stop.sleep, open = stop::open, cancelled = stop.cancelled)
                 } catch (e: Exception) {
+                    if (e is Fetch.StoppedException) { status.value = "Download paused"; return@withContext "Download paused." }
                     val m = "${Fetch.reason(e)}, so Linux didn't finish downloading. What's downloaded is kept: tap Install to carry on."
                     status.value = m
                     return@withContext m

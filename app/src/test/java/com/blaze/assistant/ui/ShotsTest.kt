@@ -1070,4 +1070,11 @@ class ShotsTest {
         }
     }
 
+
+    /** v0.33.2 BlazeOS home screen (design B): status row, frosted widgets, squircle icons, dock, the dusk wallpaper. */
+    @Test fun blazeOsHome() {
+        com.blaze.assistant.blazeos.BlazeOs.power.value = com.blaze.assistant.blazeos.Power.ON
+        com.blaze.assistant.blazeos.BlazeOs.tasks.value = com.blaze.assistant.blazeos.OsTasks()
+        shot("57-blazeos-home", dark = true) { com.blaze.assistant.blazeos.BlazeOsScreen(onExit = {}) }
+    }
 }

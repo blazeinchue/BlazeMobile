@@ -294,6 +294,13 @@ object LinkYt {
         post("https://www.youtube.com/youtubei/v1/search?prettyPrint=false", body.toString(), web, "")
     }
 
+    /** v0.34.0 playlist import: one page of a playlist (WEB browse "VL<id>", or a continuation), raw InnerTube JSON. */
+    suspend fun playlist(listId: String, continuation: String = ""): String = withContext(Dispatchers.IO) {
+        val body = JSONObject().put("context", ctx(web))
+        if (continuation.isNotBlank()) body.put("continuation", continuation) else body.put("browseId", "VL$listId")
+        post("https://www.youtube.com/youtubei/v1/browse?prettyPrint=false", body.toString(), web, "")
+    }
+
     /** Title and channel of a video (public oEmbed, no client needed). */
     suspend fun oembed(vid: String): Pair<String, String> = withContext(Dispatchers.IO) {
         val o = JSONObject(text("https://www.youtube.com/oembed?format=json&url=" + java.net.URLEncoder.encode("https://www.youtube.com/watch?v=$vid", "UTF-8")))

@@ -65,6 +65,11 @@ import androidx.compose.material.icons.rounded.SelectAll
 import androidx.compose.material.icons.rounded.Share
 import androidx.compose.material.icons.rounded.SwapVert
 import androidx.compose.material.icons.rounded.Wallpaper
+import androidx.compose.material.icons.rounded.AutoFixHigh
+import androidx.compose.material.icons.rounded.MoreVert
+import androidx.compose.material.icons.rounded.Tune
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -206,6 +211,19 @@ fun GalleryScreen(onDismiss: () -> Unit) {
     var autoplay by remember { mutableStateOf("") }
     var dialog by remember { mutableStateOf<GDialog?>(null) }
     var canPhone by remember { mutableStateOf(GalleryRepo.canReadPhone()) }
+    // v0.34.0: clean up, trash, backup plan, editor, pinch columns, location stripping on share
+    var extra by remember { mutableStateOf("") }   // clean | trash | backup
+    var editing by remember { mutableStateOf<Entry?>(null) }
+    var cols by remember { androidx.compose.runtime.mutableIntStateOf(3) }
+    var strip by remember { mutableStateOf(com.blaze.assistant.mediaapps.MediaPrefs.bool(ctx, com.blaze.assistant.mediaapps.MediaPrefs.STRIP_GPS, true)) }
+    var moreMenu by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) { kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { com.blaze.assistant.media.GalleryClean.purge(ctx) } }
+    fun share(list: List<Entry>) {
+        scope.launch {
+            val l = if (strip) kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { com.blaze.assistant.media.GalleryClean.withoutLocation(ctx, list) } else list
+            try { ctx.startActivity(GalleryRepo.shareIntent(l)) } catch (_: Exception) { }
+        }
+    }
 
     val deleteLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { GalleryRepo.refresh() }
     val permLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
@@ -241,12 +259,14 @@ fun GalleryScreen(onDismiss: () -> Unit) {
         autoplay = if (e.kind != "image") e.id else ""
     }
 
+    /** v0.34.0: Delete moves to the 30-day Trash (Android's own trash for phone photos on Android 11+). */
     fun doDelete(list: List<Entry>) {
         scope.launch {
-            val sender = GalleryRepo.delete(list)
+            val (moved, sender) = com.blaze.assistant.media.GalleryClean.trash(ctx, list)
             selected = emptySet()
             if (sender != null) try { deleteLauncher.launch(IntentSenderRequest.Builder(sender).build()) } catch (_: Exception) { }
-            Toast.makeText(ctx, if (sender != null) "Confirm to delete the rest." else if (list.size == 1) "Deleted." else "Deleted ${list.size} items.", Toast.LENGTH_SHORT).show()
+            GalleryRepo.refresh()
+            Toast.makeText(ctx, if (sender != null) "Confirm to move the phone's photos to the Trash." else if (moved == 1 || list.size == 1) "Moved to Trash (30 days)." else "Moved ${list.size} items to Trash (30 days).", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -284,6 +304,16 @@ fun GalleryScreen(onDismiss: () -> Unit) {
                             "Smallest first" to { sort = GalleryModel.Sort.SIZE; asc = true },
                         ))
                     }
+                    if (albumId == null) HeaderIcon(Icons.Rounded.AutoFixHigh, "Clean up") { extra = "clean" }
+                    if (albumId == null) Box {
+                        HeaderIcon(Icons.Rounded.MoreVert, "More") { moreMenu = true }
+                        BlazeMenu(moreMenu, onDismiss = { moreMenu = false }, items = listOf(
+                            "Trash" to { extra = "trash" },
+                            "Backup plan" to { extra = "backup" },
+                            (if (strip) "Remove location when sharing: on" else "Remove location when sharing: off") to {
+                                strip = !strip; com.blaze.assistant.mediaapps.MediaPrefs.setBool(ctx, com.blaze.assistant.mediaapps.MediaPrefs.STRIP_GPS, strip) },
+                        ))
+                    }
                     if (userAlbum != null) Box {
                         var menu by remember { mutableStateOf(false) }
                         HeaderIcon(Icons.Rounded.Edit, "Album options") { menu = true }
@@ -319,7 +349,26 @@ fun GalleryScreen(onDismiss: () -> Unit) {
                         }
                     }
                 } else {
-                    LazyVerticalGrid(GridCells.Fixed(3), Modifier.fillMaxSize().padding(horizontal = 2.dp), state = gridState) {
+                    val otd = remember(all, now) { if (tab == "all") com.blaze.assistant.media.GalleryTools.onThisDay(all, now) else emptyList() }
+                    LazyVerticalGrid(GridCells.Fixed(cols), Modifier.fillMaxSize().padding(horizontal = 2.dp)
+                        .pointerInput(Unit) {
+                            // v0.34.0 pinch the grid: two fingers apart = bigger tiles, together = more columns (2 to 6).
+                            awaitEachGesture {
+                                var zoom = 1f
+                                do {
+                                    val ev = awaitPointerEvent(androidx.compose.ui.input.pointer.PointerEventPass.Initial)
+                                    if (ev.changes.size >= 2) {
+                                        zoom *= ev.calculateZoom()
+                                        ev.changes.forEach { it.consume() }
+                                        val n = com.blaze.assistant.media.GalleryTools.columnsAfterPinch(cols, zoom)
+                                        if (n != cols) { cols = n; zoom = 1f }
+                                    }
+                                } while (ev.changes.any { it.pressed })
+                            }
+                        }, state = gridState) {
+                        if (query.isBlank() && otd.isNotEmpty() && albumId == null) item(key = "onthisday", span = { GridItemSpan(maxLineSpan) }) {
+                            OnThisDayCard(otd, now) { openViewer(it) }
+                        }
                         items(cells, key = { it.key }, span = { cell -> GridItemSpan(if (cell is GalleryModel.Cell.Header) maxLineSpan else 1) },
                             contentType = { if (it is GalleryModel.Cell.Header) 0 else 1 }) { cell ->
                             when (cell) {
@@ -347,7 +396,7 @@ fun GalleryScreen(onDismiss: () -> Unit) {
             // ---------------- selection actions
             if (selected.isNotEmpty()) {
                 Row(Modifier.fillMaxWidth().hairlineTop(c.hair).padding(horizontal = 6.dp, vertical = 6.dp), horizontalArrangement = Arrangement.SpaceEvenly) {
-                    BarAction(Icons.Rounded.Share, "Share") { try { ctx.startActivity(GalleryRepo.shareIntent(selectedItems)) } catch (_: Exception) { } }
+                    BarAction(Icons.Rounded.Share, "Share") { share(selectedItems) }
                     BarAction(Icons.Rounded.CreateNewFolder, "Album") { dialog = GDialog.PickAlbum(selectedItems, null) }
                     if (userAlbum != null) {
                         BarAction(Icons.Rounded.FolderOpen, "Move") { dialog = GDialog.PickAlbum(selectedItems, userAlbum.id) }
@@ -355,7 +404,7 @@ fun GalleryScreen(onDismiss: () -> Unit) {
                             GalleryRepo.removeFromAlbum(userAlbum.id, selected.toList()); selected = emptySet()
                         }
                     }
-                    BarAction(Icons.Rounded.Delete, "Delete") { dialog = GDialog.Delete(selectedItems, fromViewer = false) }
+                    BarAction(Icons.Rounded.Delete, "Trash") { dialog = GDialog.Delete(selectedItems, fromViewer = false) }
                 }
             }
         }
@@ -373,7 +422,8 @@ fun GalleryScreen(onDismiss: () -> Unit) {
                 },
                 onAction = { action, e ->
                     when (action) {
-                        "share" -> try { ctx.startActivity(GalleryRepo.shareIntent(listOf(e))) } catch (_: Exception) { }
+                        "share" -> share(listOf(e))
+                        "edit" -> editing = e
                         "rename" -> dialog = GDialog.Rename(e)
                         "info" -> dialog = GDialog.Info(e)
                         "wallpaper" -> dialog = GDialog.Wallpaper(e)
@@ -384,13 +434,21 @@ fun GalleryScreen(onDismiss: () -> Unit) {
         }
     }
 
+    // ---------------- v0.34.0 extras
+    when (extra) {
+        "clean" -> CleanUpDialog(all, onTrash = { l -> extra = ""; doDelete(l) }, onDismiss = { extra = "" })
+        "trash" -> TrashDialog(onRestorePhone = { snd -> try { deleteLauncher.launch(IntentSenderRequest.Builder(snd).build()) } catch (_: Exception) { } }, onDismiss = { extra = ""; GalleryRepo.refresh() })
+        "backup" -> BackupPlanDialog(all) { extra = "" }
+    }
+    editing?.let { e -> PhotoEditor(e) { editing = null } }
+
     // ---------------- dialogs
     when (val d = dialog) {
         null -> {}
         is GDialog.Delete -> BlazeDialog(
-            title = if (d.items.size == 1) "Delete \u201c${d.items[0].title.take(40)}\u201d?" else "Delete ${d.items.size} items?",
-            body = "This removes the file from your phone, not just from the Gallery. It can't be undone.",
-            confirm = "Delete", warm = true, dismiss = "Cancel", onDismiss = { dialog = null },
+            title = if (d.items.size == 1) "Move \u201c${d.items[0].title.take(40)}\u201d to Trash?" else "Move ${d.items.size} items to Trash?",
+            body = "They stay in the Trash for 30 days (Gallery \u203a \u22ee \u203a Trash), then are deleted for good.",
+            confirm = "Move to Trash", warm = true, dismiss = "Cancel", onDismiss = { dialog = null },
             onConfirm = { dialog = null; GalleryAudio.stop(); doDelete(d.items) })
         is GDialog.Rename -> TextDialog("Rename", d.item.name.substringBeforeLast('.'), "New name", "Rename", onDismiss = { dialog = null }) { t ->
             dialog = null
@@ -675,11 +733,12 @@ private fun GalleryViewer(list: List<Entry>, start: Int, autoplay: String, origi
             Row(Modifier.align(Alignment.BottomCenter).fillMaxWidth().graphicsLayer { alpha = anim.value }.background(Brush.verticalGradient(listOf(Color.Transparent, Color(0xAA000000))))
                 .navigationBarsPadding().padding(horizontal = 4.dp, vertical = 8.dp), horizontalArrangement = Arrangement.SpaceEvenly) {
                 BarAction(Icons.Rounded.Share, "Share", Color.White) { onAction("share", cur) }
+                if (cur.kind == "image") BarAction(Icons.Rounded.Tune, "Edit", Color.White) { onAction("edit", cur) }
                 BarAction(Icons.Rounded.Edit, "Rename", Color.White) { onAction("rename", cur) }
                 BarAction(Icons.Rounded.Info, "Info", Color.White) { onAction("info", cur) }
                 if (cur.kind == "image") BarAction(Icons.Rounded.Wallpaper, "Wallpaper", Color.White) { onAction("wallpaper", cur) }
                 BarAction(Icons.Rounded.CreateNewFolder, "Album", Color.White) { onAction("album", cur) }
-                BarAction(Icons.Rounded.Delete, "Delete", Color.White) { onAction("delete", cur) }
+                BarAction(Icons.Rounded.Delete, "Trash", Color.White) { onAction("delete", cur) }
             }
         }
     }

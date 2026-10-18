@@ -132,6 +132,146 @@ class VideoActivity : ComponentActivity() {
     companion object {
         fun open(ctx: Context, tab: String = "") = ctx.startActivity(Intent(ctx, VideoActivity::class.java)
             .putExtra(MusicActivity.EXTRA_TAB, tab).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT))
+        const val EXTRA_PLAY = "blaze_video_play"
+        /** v0.34.0: plays a library video (agent tool video_ops play). */
+        fun openAndPlay(ctx: Context, key: String) = ctx.startActivity(Intent(ctx, VideoActivity::class.java)
+            .putExtra(EXTRA_PLAY, key).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT))
+        /** The open Video app (same process), for the agent's video_ops tool. */
+        @Volatile var live: VideoActivity? = null
+            private set
+    }
+
+    // ---------------------------------------------------------------- v0.34.0 smart video
+    /** The next episode waiting on the "Up next" countdown (null = none). */
+    val upNext = mutableStateOf<Track?>(null)
+    var upNextAt = 0L
+    /** Recap / translation progress and results for the player screen. */
+    val recapText = mutableStateOf<String?>(null)
+    val work = mutableStateOf("")
+    private var intros: MutableMap<String, Long> = HashMap()
+
+    fun seriesKey(t: Track?): String? = t?.let { VideoSmart.episode(it.title)?.key }
+    fun introEnd(t: Track?): Long = seriesKey(t)?.let { intros[it] } ?: 0L
+
+    fun markIntroEnd() {
+        val k = seriesKey(current.value) ?: return
+        val at = player.currentPosition
+        intros[k] = at; MediaPrefs.setIntro(this, k, at)
+        Toast.makeText(this, "Skip intro will jump to ${TimeText.clock(at)} in every episode.", Toast.LENGTH_SHORT).show()
+    }
+
+    fun skipIntro() { val e = introEnd(current.value); if (e > 0) player.seekTo(e) }
+
+    private fun onEnded() {
+        val t = current.value ?: return
+        if (t.source != "stream") MediaPrefs.markFinished(this, t.key, System.currentTimeMillis())
+        if (!MediaPrefs.autoplay(this) || t.source == "stream") return
+        val next = VideoSmart.next(t, MediaLib.videos.value) ?: return
+        upNextAt = System.currentTimeMillis(); upNext.value = next
+    }
+
+    fun cancelUpNext() { upNext.value = null }
+
+    /** The subtitle track that's on now (or the first loaded one) with its cues. */
+    private fun activeCues(): Pair<StoreSubtitle, List<Cue>>? {
+        val on = player.currentTracks.groups.firstOrNull { it.type == C.TRACK_TYPE_TEXT && it.isSelected }?.let { g ->
+            (0 until g.length).firstOrNull { g.isTrackSelected(it) }?.let { g.getTrackFormat(it) } }
+        val t = subsLoaded.firstOrNull { s -> on != null && (on.id == s.id || on.id?.endsWith(":" + s.id) == true || on.label == Subs.label(s)) }
+            ?: subsLoaded.firstOrNull() ?: return null
+        val cues = SubsLoader.cues(t)
+        return if (cues.isEmpty()) null else t to cues
+    }
+
+    /** A first subtitle track to work from when none is loaded: the viewer's language, else English, else any. */
+    private suspend fun ensureSomeSubs(): Pair<StoreSubtitle, List<Cue>>? {
+        activeCues()?.let { return it }
+        val t = current.value ?: return null
+        val cand = Subs.ordered(subsAvailable.value, java.util.Locale.getDefault().language).firstOrNull() ?: return null
+        val local = if (cand.url.startsWith("file:")) cand else {
+            val cues = SubsLoader.fetchYouTube(cand); if (cues.isEmpty()) return null
+            withContext(Dispatchers.IO) { SubsLoader.save(this@VideoActivity, t.key, cand, cues) }
+        }
+        val cues = SubsLoader.cues(local)
+        return if (cues.isEmpty()) null else local to cues
+    }
+
+    /** "Recap so far": what was said up to here, summed up by Blaze's model. Null result = it couldn't. */
+    suspend fun recap(): String {
+        val t = current.value ?: return "Nothing is playing."
+        work.value = "Writing a recap…"
+        try {
+            val (_, cues) = ensureSomeSubs() ?: return "This video has no subtitles, so there's nothing to recap from. Load a .srt or .vtt file first."
+            val text = VideoSmart.transcript(cues, player.currentPosition)
+            if (text.isBlank()) return "Nothing has been said yet at this point."
+            val msgs = org.json.JSONArray().put(org.json.JSONObject().put("role", "user").put("content", VideoSmart.recapPrompt(t.title, text)))
+            val out = com.blaze.assistant.agent.LlmClient.complete(msgs, null, null, null, com.blaze.assistant.agent.LlmClient.Lane.BACKGROUND)
+                .optString("content").substringAfterLast("</think>").trim()
+            return out.ifBlank { "Blaze couldn't write a recap right now. Try again in a moment." }
+        } catch (e: Exception) {
+            return "Blaze couldn't write a recap: " + (e.message ?: "no connection")
+        } finally { work.value = "" }
+    }
+
+    /**
+     * AI subtitle translation: the subtitles that are on (or the first available) translated into [language] by Blaze's
+     * model in batches, kept with the video as a new track "<language> (AI translation)" and turned on.
+     */
+    suspend fun translate(language: String): String {
+        val t = current.value ?: return "Nothing is playing."
+        val lang = language.trim().ifBlank { java.util.Locale.getDefault().getDisplayLanguage(java.util.Locale.ENGLISH) }
+        val (src, cues) = ensureSomeSubs() ?: return "This video has no subtitles to translate. Load a .srt or .vtt file first."
+        val batches = VideoSmart.batches(cues)
+        val out = ArrayList<Cue>()
+        try {
+            batches.forEachIndexed { i, b ->
+                work.value = "Translating subtitles to $lang · ${i + 1} of ${batches.size}"
+                val msgs = org.json.JSONArray().put(org.json.JSONObject().put("role", "user").put("content", VideoSmart.translatePrompt(b, lang)))
+                val reply = try {
+                    com.blaze.assistant.agent.LlmClient.complete(msgs, null, null, null, com.blaze.assistant.agent.LlmClient.Lane.BACKGROUND)
+                        .optString("content").substringAfterLast("</think>")
+                } catch (_: Exception) { "" }
+                out += VideoSmart.applyTranslation(b, reply)
+            }
+        } finally { work.value = "" }
+        if (VideoSmart.translatedShare(cues, out) < 0.3) return "The translation didn't come back. Check the connection and try again."
+        val code = langCode(lang)
+        val track = StoreSubtitle("ai-" + lang.lowercase().replace(Regex("[^a-z]"), "") + "-" + src.id.take(24), "", code, "$lang (AI translation)", auto = true)
+        val local = withContext(Dispatchers.IO) { SubsLoader.save(this@VideoActivity, t.key, track, out) }
+        if (current.value?.key == t.key) attach(local)
+        return "Subtitles translated to $lang and turned on (${out.size} lines)."
+    }
+
+    private fun langCode(name: String): String {
+        val n = name.trim().lowercase()
+        if (n.length in 2..3 && n.all { it.isLetter() }) return n
+        return java.util.Locale.getAvailableLocales().firstOrNull { it.getDisplayLanguage(java.util.Locale.ENGLISH).equals(name.trim(), true) }?.language.orEmpty()
+    }
+
+    /** Agent: turn subtitles on in [language] ("off" turns them off). */
+    fun subtitlesTo(language: String): String {
+        if (language.equals("off", true)) { subtitlesOff(); return "Subtitles off." }
+        val want = language.trim()
+        val match = { s: StoreSubtitle -> Subs.sameLang(s.lang, want) || Subs.label(s).contains(want, true) }
+        val tr = subsAvailable.value.filter(match).sortedBy { it.auto }.firstOrNull() ?: return "No $want subtitles for this video. I can translate the ones it has (video_ops translate_subtitles)."
+        chooseSubtitle(Subs.MenuItem(tr.id, Subs.label(tr), tr.lang, subsLoaded.any { it.id == tr.id }, false))
+        return "Turning on ${Subs.label(tr)} subtitles."
+    }
+
+    /** Smart downloads: watched episodes are cleared a day after they finished. */
+    private fun smartCleanup() {
+        if (!MediaPrefs.smartDownloads(this)) return
+        val gone = VideoSmart.toClear(MediaLib.videos.value, MediaPrefs.finished(this), System.currentTimeMillis())
+        gone.forEach { MediaLib.deleteDownload(this, it.key) }
+        if (gone.isNotEmpty()) lifecycleScope.launch { Toast.makeText(this@VideoActivity, "Smart downloads cleared ${gone.size} watched episode" + (if (gone.size == 1) "" else "s") + ".", Toast.LENGTH_SHORT).show() }
+    }
+
+    private fun handlePlay(i: Intent?) {
+        val key = i?.getStringExtra(EXTRA_PLAY)?.takeIf { it.isNotBlank() } ?: return
+        i.removeExtra(EXTRA_PLAY)
+        lifecycleScope.launch {
+            withContext(Dispatchers.IO) { MediaLib.ensure(this@VideoActivity) }
+            MediaLib.find(key)?.let { play(it) }
+        }
     }
 
     lateinit var player: ExoPlayer
@@ -163,7 +303,10 @@ class VideoActivity : ComponentActivity() {
         enableEdgeToEdge()
         intent?.getStringExtra(MusicActivity.EXTRA_TAB)?.takeIf { it.isNotBlank() }?.let { tab.value = it }
         com.blaze.assistant.mediaapps.store.JamendoSource.init(this)
-        lifecycleScope.launch(Dispatchers.IO) { MediaLib.ensure(this@VideoActivity); Downloads.resumePending(this@VideoActivity) }
+        lifecycleScope.launch(Dispatchers.IO) { MediaLib.ensure(this@VideoActivity); Downloads.resumePending(this@VideoActivity); smartCleanup() }
+        intros = MediaPrefs.intros(this).toMutableMap()
+        live = this
+        handlePlay(intent)
         player = ExoPlayer.Builder(this)
             .setMediaSourceFactory(DefaultMediaSourceFactory(DefaultDataSource.Factory(this, http)))
             .setAudioAttributes(AudioAttributes.Builder().setUsage(C.USAGE_MEDIA).setContentType(C.AUDIO_CONTENT_TYPE_MOVIE).build(), true)
@@ -175,7 +318,17 @@ class VideoActivity : ComponentActivity() {
                 if (isPlaying) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) else { window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON); savePos() }
                 if (Build.VERSION.SDK_INT >= 26) runCatching { setPictureInPictureParams(pipParams()) }
             }
-            override fun onPlaybackStateChanged(state: Int) { if (state == Player.STATE_ENDED) current.value?.let { MediaLib.savePosition(it.key, 0, 1) } }
+            override fun onPlaybackStateChanged(state: Int) {
+                if (state == Player.STATE_ENDED) { current.value?.let { MediaLib.savePosition(it.key, 0, 1) }; onEnded() }
+            }
+            override fun onPositionDiscontinuity(old: Player.PositionInfo, new: Player.PositionInfo, reason: Int) {
+                // v0.34.0 skip intro: an early jump forward in an episode teaches where the series' intro ends.
+                if (reason != Player.DISCONTINUITY_REASON_SEEK || old.mediaItemIndex != new.mediaItemIndex) return
+                val k = seriesKey(current.value) ?: return
+                val known = intros[k] ?: 0L
+                val learned = VideoSmart.learnIntro(known, old.positionMs, new.positionMs)
+                if (learned != known) { intros[k] = learned; MediaPrefs.setIntro(this@VideoActivity, k, learned) }
+            }
             override fun onPlayerError(error: PlaybackException) { retryStream(error) }
             override fun onTracksChanged(t: Tracks) {
                 tracks.value = t
@@ -189,6 +342,7 @@ class VideoActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         intent.getStringExtra(MusicActivity.EXTRA_TAB)?.takeIf { it.isNotBlank() }?.let { tab.value = it }
+        handlePlay(intent)
     }
 
     fun savePos() {
@@ -200,6 +354,7 @@ class VideoActivity : ComponentActivity() {
     /** Plays a library video from where it was left. */
     fun play(t: Track) {
         savePos()
+        upNext.value = null
         current.value = t
         MediaLib.played(t)
         playUris = listOf(t.uri)
@@ -211,8 +366,9 @@ class VideoActivity : ComponentActivity() {
         subsLoaded.addAll(subsAvailable.value.filter { s -> subsLoaded.none { it.id == s.id } })
         load(at, true)
         tab.value = "player"
-        if (t.videoId.isNotBlank()) lifecycleScope.launch {
-            val yt = try { LinkSource.ytCaptions(t.videoId) } catch (_: Exception) { emptyList() }
+        val vid = t.videoId.removePrefix("yt:")
+        if ((t.storeSource == "youtube" || t.videoId.startsWith("yt:")) && Regex("^[A-Za-z0-9_-]{11}$").matches(vid)) lifecycleScope.launch {
+            val yt = try { LinkSource.ytCaptions(vid) } catch (_: Exception) { emptyList() }
             if (current.value?.key == t.key) mergeAvailable(yt)
         }
     }
@@ -337,8 +493,10 @@ class VideoActivity : ComponentActivity() {
 
     /** Watch a Store result without downloading: one progressive file, or video + audio merged while playing. */
     fun watch(item: StoreItem, d: StoreDetail, src: StoreSource, at: Long = 0) {
-        val picks = src.streamPick("video", d)
+        // v0.34.0 data saver: on mobile data the smallest picture (240p or more).
+        val picks = VideoSmart.streamFor("video", d, src, MediaPrefs.saving(this))
         if (picks.isEmpty()) return
+        upNext.value = null
         lastWatch = item to src
         if (at == 0L) retriedKey = ""
         savePos()
@@ -416,6 +574,7 @@ class VideoActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        if (live === this) live = null
         savePos()
         player.release()
         super.onDestroy()
@@ -486,6 +645,14 @@ private fun PlayerSurface(a: VideoActivity, controls: Boolean) {
     var hint by remember { mutableStateOf("") }
     var speedMenu by remember { mutableStateOf(false) }
     var tracksOpen by remember { mutableStateOf(false) }
+    var moreMenu by remember { mutableStateOf(false) }
+    var autoplayOn by remember { mutableStateOf(MediaPrefs.autoplay(ctx)) }
+    var smartOn by remember { mutableStateOf(MediaPrefs.smartDownloads(ctx)) }
+    val scope = androidx.compose.runtime.rememberCoroutineScope()
+    val cur by a.current
+    val nextUp by a.upNext
+    val busyWork by a.work
+    val recap by a.recapText
     var speed by remember { mutableFloatStateOf(p.playbackParameters.speed) }
     DisposableEffect(p) {
         val l = object : Player.Listener {
@@ -575,6 +742,30 @@ private fun PlayerSurface(a: VideoActivity, controls: Boolean) {
             Spacer(Modifier.height(10.dp))
             PillButton("Try again", primary = true) { p.prepare(); p.play() }
         }
+        // v0.34.0: Skip intro (learned per series), Up next countdown, recap / translation progress.
+        val introAt = a.introEnd(cur)
+        if (controls && VideoSmart.showSkip(pos, introAt)) Box(Modifier.align(Alignment.BottomEnd).padding(end = 16.dp, bottom = 72.dp)) {
+            PillButton("Skip intro", primary = true) { a.skipIntro() }
+        }
+        nextUp?.let { nx ->
+            var left by remember(nx.key) { mutableStateOf(5) }
+            LaunchedEffect(nx.key) {
+                while (true) { left = VideoSmart.countdown(a.upNextAt, System.currentTimeMillis()); if (left < 0) break; delay(250) }
+                a.play(nx)
+            }
+            Column(Modifier.align(Alignment.BottomEnd).padding(16.dp).clip(BlazeShapes.medium).background(Color.Black.copy(alpha = 0.8f)).padding(14.dp)) {
+                MText("Up next in ${left.coerceAtLeast(0)}", 12.sp, Color.White.copy(alpha = 0.8f))
+                MText(nx.title, 14.sp, Color.White, FontWeight.SemiBold, maxLines = 2)
+                Spacer(Modifier.height(8.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    PillButton("Cancel", primary = false) { a.cancelUpNext() }
+                    PillButton("Play now", primary = true) { a.play(nx) }
+                }
+            }
+        }
+        if (busyWork.isNotBlank()) Box(Modifier.align(Alignment.TopStart).padding(10.dp).clip(BlazeShapes.small).background(Color.Black.copy(alpha = 0.7f)).padding(horizontal = 10.dp, vertical = 6.dp)) {
+            MText(busyWork, 12.sp, Color.White)
+        }
         if (controls) AnimatedVisibility(show && error.isBlank(), Modifier.fillMaxSize(), enter = MotionTokens.fade(), exit = MotionTokens.fadeAway()) {
             Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.35f))) {
                 Row(Modifier.align(Alignment.TopEnd).padding(6.dp)) {
@@ -584,6 +775,20 @@ private fun PlayerSurface(a: VideoActivity, controls: Boolean) {
                     }
                     RoundIcon(Icons.Rounded.ClosedCaption, "Subtitles and audio", tint = Color.White) { tracksOpen = true }
                     if (Build.VERSION.SDK_INT >= 26) RoundIcon(Icons.Rounded.PictureInPictureAlt, "Picture in picture", tint = Color.White) { a.enterPip() }
+                    Box {
+                        RoundIcon(Icons.Rounded.MoreVert, "More", tint = Color.White) { moreMenu = true }
+                        val lang = java.util.Locale.getDefault().getDisplayLanguage(java.util.Locale.ENGLISH)
+                        BlazeMenu(moreMenu, { moreMenu = false }, buildList<Pair<String, () -> Unit>> {
+                            add("Recap so far" to { scope.launch { a.recapText.value = a.recap() } })
+                            add("Translate subtitles to $lang (AI)" to { scope.launch { val r = a.translate(lang); android.widget.Toast.makeText(ctx, r, android.widget.Toast.LENGTH_LONG).show() } })
+                            if (a.seriesKey(a.current.value) != null) add("Mark the end of the intro here" to { a.markIntroEnd() })
+                            add((if (autoplayOn) "Autoplay next episode: on" else "Autoplay next episode: off") to {
+                                autoplayOn = !autoplayOn; MediaPrefs.setBool(ctx, MediaPrefs.AUTOPLAY, autoplayOn) })
+                            add((if (smartOn) "Smart downloads: on" else "Smart downloads: off") to {
+                                smartOn = !smartOn; MediaPrefs.setBool(ctx, MediaPrefs.SMART_DL, smartOn)
+                                android.widget.Toast.makeText(ctx, if (smartOn) "Watched episodes you downloaded are cleared a day after you finish them." else "Smart downloads off.", android.widget.Toast.LENGTH_SHORT).show() })
+                        })
+                    }
                 }
                 Row(Modifier.align(Alignment.Center), horizontalArrangement = Arrangement.spacedBy(28.dp), verticalAlignment = Alignment.CenterVertically) {
                     RoundIcon(Icons.Rounded.Replay10, "Back 10 seconds", size = 52, tint = Color.White) { p.seekBack() }
@@ -609,6 +814,7 @@ private fun PlayerSurface(a: VideoActivity, controls: Boolean) {
         }
     }
     if (tracksOpen) TracksDialog(a) { tracksOpen = false }
+    recap?.let { r -> BlazeDialog("Recap so far", r, confirm = "Keep watching", onConfirm = { a.recapText.value = null }, onDismiss = { a.recapText.value = null }) }
 }
 
 /**
@@ -710,6 +916,29 @@ private fun VideoLibrary(a: VideoActivity) {
                             Spacer(Modifier.height(4.dp))
                             MText(t.title, 12.5.sp, c.ink, FontWeight.Medium)
                             MText("${TimeText.clock(MediaLib.position(t.key))} watched", 11.5.sp, c.sub)
+                        }
+                    }
+                }
+            }
+        }
+        // v0.34.0 episode grouping: series (two or more episodes) in order, with what's next to watch.
+        val series = if (q.isBlank()) VideoSmart.series(videos) else emptyList()
+        series.forEach { (name, eps) ->
+            item(span = { GridItemSpan(maxLineSpan) }, key = "series-$name") {
+                Column {
+                    val upto = eps.indexOfLast { MediaLib.position(it.key) > 0 || it.key in recent }.coerceAtLeast(0)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        MText("$name \u00b7 ${eps.size} episodes", 15.sp, c.ink, FontWeight.SemiBold, modifier = Modifier.weight(1f))
+                        PillButton(if (upto > 0) "Continue" else "Play", primary = false) { a.play(eps[upto]) }
+                    }
+                    Spacer(Modifier.height(6.dp))
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        items(eps, key = { "s" + it.key }) { t ->
+                            Column(Modifier.width(150.dp).clip(BlazeShapes.small).clickable { a.play(t) }) {
+                                Art(t, Modifier.fillMaxWidth().aspectRatio(16f / 9f), target = 300)
+                                val e = VideoSmart.episode(t.title)
+                                MText(if (e != null) "S${e.season} \u00b7 E${e.episode}" else t.title, 12.sp, c.ink, FontWeight.Medium)
+                            }
                         }
                     }
                 }
